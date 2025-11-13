@@ -71,4 +71,4 @@ streamlit run app.py
 - **Predicciones raras**: confirma que el preprocesamiento (tamaño/normalización) coincida con el del entrenamiento.
 - **CUDA/MPS**: la app usa automáticamente GPU si está disponible; si no, CPU.
 
-¡Listo! 🎉
+¡Listoooo! 🎉
