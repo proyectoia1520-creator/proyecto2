@@ -194,7 +194,7 @@ with col1:
     img_pil = None
     if uploaded is not None:
         img_pil = Image.open(io.BytesIO(uploaded.read())).convert("RGB")
-        st.image(img_pil, caption="imagen cargada", use_container_width=True)
+        st.image(img_pil, caption="imagen cargada", width='stretch')
 
 with col2:
     st.subheader("modelo")
