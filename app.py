@@ -23,43 +23,76 @@ st.title("🫁 Pulmo-ML Viewer - clasificacion pulmonar")
 # ----------------------------
 @st.cache_resource
 def load_ckpt(ckpt_path: Path, force_classes=None):
-    """
-    Carga un checkpoint propio con estructura tipo:
-      {"model": state_dict, "classes": [...], "args":{"model":"resnet18|resnet50"}, "temperature": ...}
-    Si no hay 'classes' y force_classes se provee (desde la UI), usa ese orden manual.
-    Hace intento estricto; si falla, carga no estricta y guarda warnings en model.__load_warnings__
-    """
+    import re
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
-    # resolver clases
+    # --- clases ---
     if force_classes:
         classes = force_classes
     else:
         classes = ckpt.get("classes")
         if classes is None:
             raise ValueError("el checkpoint no trae 'classes'; define el orden manual en la barra lateral")
-
-    model_name = (ckpt.get("args", {}) or {}).get("model", "resnet18").lower()
     num_classes = len(classes)
 
-    # construir modelo
+    # --- state_dict bruto (acepta ckpt['model'] o el dict entero) ---
+    raw = ckpt.get("model", ckpt)
+    if not isinstance(raw, dict):
+        raise ValueError("el checkpoint no contiene un dict de pesos en 'model'")
+
+    # --- desanidar y quitar prefijos comunes ---
+    def unwrap(sd):
+        for k in ("state_dict","model_state_dict","weights","params","model"):
+            if isinstance(sd, dict) and k in sd and isinstance(sd[k], dict):
+                sd = sd[k]
+        return sd
+    sd = unwrap(raw)
+
+    def strip_prefixes(sd, prefixes=("module.","model.","backbone.")):
+        out = {}
+        for k,v in sd.items():
+            nk = k
+            for p in prefixes:
+                if nk.startswith(p):
+                    nk = nk[len(p):]
+            out[nk] = v
+        return out
+    sd = strip_prefixes(sd)
+
+    # --- auto-detect de resnet18 vs resnet50 por llaves ---
+    # Heuristica: ResNet50 (bottleneck) tiene conv3 en los bloques: layer1.0.conv3, layer2.*.conv3, etc.
+    keys = list(sd.keys())
+    has_conv3 = any(".conv3.weight" in k for k in keys)  # tipico de bottleneck
+    # Si el ckpt trae args, se respeta; si no, heuristica
+    model_name = (ckpt.get("args", {}) or {}).get("model")
+    if model_name is None:
+        model_name = "resnet50" if has_conv3 else "resnet18"
+    model_name = model_name.lower()
+
+    # --- construir el modelo correcto ---
     if model_name == "resnet50":
         model = tvm.resnet50(weights=None)
     else:
         model = tvm.resnet18(weights=None)
     model.fc = nn.Linear(model.fc.in_features, num_classes)
 
-    # cargar pesos
-    state_dict = ckpt.get("model", ckpt)
+    # --- cargar pesos: primero estricto; si falla, no estricto y reporta ---
+    warn = None
     try:
-        model.load_state_dict(state_dict, strict=True)
+        model.load_state_dict(sd, strict=True)
     except Exception as e:
-        # reintento no estricto para continuar, pero guardamos aviso
-        warn = model.load_state_dict(state_dict, strict=False)
-        model.__load_warnings__ = warn  # missing_keys, unexpected_keys
-    model.eval()
+        warn = model.load_state_dict(sd, strict=False)
+        model.__load_warnings__ = warn
 
+    model.eval()
     temp = ckpt.get("temperature", None)
+
+    # --- adjunta debug corto de llaves para UI ---
+    if warn:
+        miss = list(warn.missing_keys)[:10]
+        unexp = list(warn.unexpected_keys)[:10]
+        model.__load_debug__ = {"missing_sample": miss, "unexpected_sample": unexp}
+
     return model, classes, temp, model_name
 
 
@@ -168,6 +201,10 @@ with col2:
             warn = getattr(model, "__load_warnings__", None)
             if warn:
                 st.warning(f"carga no estricta: missing={len(warn.missing_keys)}, unexpected={len(warn.unexpected_keys)}")
+                dbg = getattr(model, "__load_debug__", {})
+                if dbg:
+                    st.caption(f"missing_sample: {dbg.get('missing_sample')}")
+                    st.caption(f"unexpected_sample: {dbg.get('unexpected_sample')}")
             st.caption(f"fc.out_features = {model.fc.out_features}")
         except Exception as e:
             st.error(f"error al cargar: {e}")
