@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+env/
+venv/
+*.egg-info/
+
+# Streamlit
+.streamlit/
+
+# Models (opcional si los versionas con LFS)
+# models/*.pt
+
+# OS
+.DS_Store
+Thumbs.db
