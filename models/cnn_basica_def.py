@@ -1,3 +1,4 @@
+# models/cnn_basica_def.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -5,7 +6,6 @@ import torch.nn.functional as F
 class CNNSimple(nn.Module):
     def __init__(self, num_classes=5):
         super().__init__()
-        # capas con los nombres exactos del checkpoint
         self.f0 = nn.Conv2d(3, 32, 3, padding=1)
         self.f3 = nn.Conv2d(32, 64, 3, padding=1)
         self.f6 = nn.Conv2d(64, 128, 3, padding=1)

@@ -26,81 +26,67 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
     import re
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
-    # --- clases ---
-    if force_classes:
-        classes = force_classes
-    else:
-        classes = ckpt.get("classes")
-        if classes is None:
-            raise ValueError("el checkpoint no trae 'classes'; define el orden manual en la barra lateral")
+    # clases
+    classes = force_classes if force_classes else ckpt.get("classes")
+    if not classes:
+        raise ValueError("El checkpoint no trae 'classes' y no se ingreso un orden manual.")
     num_classes = len(classes)
 
-    # --- state_dict bruto (acepta ckpt['model'] o el dict entero) ---
-    raw = ckpt.get("model", ckpt)
-    if not isinstance(raw, dict):
-        raise ValueError("el checkpoint no contiene un dict de pesos en 'model'")
+    # arquitectura
+    model_name = (ckpt.get("arch") or (ckpt.get("args",{}) or {}).get("model") or "cnn_basica").lower()
 
-    # --- desanidar y quitar prefijos comunes ---
-    def unwrap(sd):
-        for k in ("state_dict","model_state_dict","weights","params","model"):
-            if isinstance(sd, dict) and k in sd and isinstance(sd[k], dict):
-                sd = sd[k]
-        return sd
-    sd = unwrap(raw)
+    # state_dict crudo
+    sd = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt.get("model") or ckpt
+    if not isinstance(sd, dict):
+        raise ValueError("No se encontro un dict de pesos en el checkpoint.")
 
-    def strip_prefixes(sd, prefixes=("module.","model.","backbone.")):
-        out = {}
-        for k,v in sd.items():
-            nk = k
+    # limpiar prefijos
+    def strip_prefixes(d, prefixes=("module.","model.","backbone.")):
+        out={}
+        for k,v in d.items():
+            nk=k
             for p in prefixes:
                 if nk.startswith(p):
                     nk = nk[len(p):]
-            out[nk] = v
+            out[nk]=v
         return out
     sd = strip_prefixes(sd)
 
-    # --- auto-detect de resnet18 vs resnet50 por llaves ---
-    # Heuristica: ResNet50 (bottleneck) tiene conv3 en los bloques: layer1.0.conv3, layer2.*.conv3, etc.
-    keys = list(sd.keys())
-    has_conv3 = any(".conv3.weight" in k for k in keys)  # tipico de bottleneck
-    # Si el ckpt trae args, se respeta; si no, heuristica
-    model_name = (ckpt.get("args", {}) or {}).get("model")
-    if model_name is None:
-        model_name = "resnet50" if has_conv3 else "resnet18"
-    model_name = model_name.lower()
-
-    # --- construir el modelo correcto ---
+    # decidir arquitectura y construir modelo
     from models.cnn_basica_def import CNNSimple
-
-    # si las llaves contienen 'f.' o 'c.', se asume CNN personalizada
-    if any(k.startswith(("f.","c.")) for k in sd.keys()):
+    # si aparecen llaves con 'f.' o 'c.' asumimos tu CNN
+    is_custom = (model_name == "cnn_basica") or any(k.startswith(("f.","c.")) for k in sd.keys())
+    if is_custom:
         model = CNNSimple(num_classes=num_classes)
+        # remap f.<num>.* -> f<num>.*  y c.<num>.* -> c<num>.*
+        fixed={}
+        pat = re.compile(r'^(f|c)\.(\d+)\.(.+)$')  # ej: f.3.weight -> f3.weight
+        for k,v in sd.items():
+            m = pat.match(k)
+            fixed[(f"{m.group(1)}{m.group(2)}.{m.group(3)}" if m else k)] = v
+        sd = fixed
         model_name = "cnn_basica"
     else:
+        import torchvision.models as tvm
+        import torch.nn as nn
         if model_name == "resnet50":
             model = tvm.resnet50(weights=None)
         else:
             model = tvm.resnet18(weights=None)
         model.fc = nn.Linear(model.fc.in_features, num_classes)
 
-
-    # --- cargar pesos: primero estricto; si falla, no estricto y reporta ---
-    warn = None
+    # cargar pesos (estricto; si falla, no estricto + warning)
     try:
         model.load_state_dict(sd, strict=True)
-    except Exception as e:
+    except Exception:
         warn = model.load_state_dict(sd, strict=False)
         model.__load_warnings__ = warn
-
-    model.eval()
-    temp = ckpt.get("temperature", None)
-
-    # --- adjunta debug corto de llaves para UI ---
-    if warn:
         miss = list(warn.missing_keys)[:10]
         unexp = list(warn.unexpected_keys)[:10]
         model.__load_debug__ = {"missing_sample": miss, "unexpected_sample": unexp}
 
+    model.eval()
+    temp = ckpt.get("temperature", None)
     return model, classes, temp, model_name
 
 
