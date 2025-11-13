@@ -213,7 +213,11 @@ with col2:
                 if dbg:
                     st.caption(f"missing_sample: {dbg.get('missing_sample')}")
                     st.caption(f"unexpected_sample: {dbg.get('unexpected_sample')}")
-            st.caption(f"fc.out_features = {model.fc.out_features}")
+            if hasattr(model, "fc"):
+                st.caption(f"fc.out_features = {model.fc.out_features}")
+            else:
+                st.caption("modelo sin capa fc (CNN personalizada)")
+
         except Exception as e:
             st.error(f"error al cargar: {e}")
 
