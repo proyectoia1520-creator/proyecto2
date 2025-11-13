@@ -74,7 +74,21 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
         else:
             model = tvm.resnet18(weights=None)
         model.fc = nn.Linear(model.fc.in_features, num_classes)
-
+    
+    # --- NORMALIZAR LLAVES DE LA CABEZA FC PARA RESNET ---
+    def remap_resnet_fc_keys(sd: dict):
+        # Si el ckpt trae una cabeza secuencial (fc.1.*), mapeamos a fc.*
+        if "fc.weight" not in sd and any(k.startswith("fc.1.") for k in sd.keys()):
+            fixed = {}
+            for k, v in sd.items():
+                if k.startswith("fc.1."):
+                    fixed["fc." + k[len("fc.1."):]] = v  # fc.1.weight -> fc.weight
+                elif not k.startswith("fc.0."):         # fc.0.* suele ser Dropout/ReLU sin params
+                    fixed[k] = v
+            return fixed
+        return sd
+    
+    sd = remap_resnet_fc_keys(sd)
     # cargar pesos (estricto; si falla, no estricto + warning)
     try:
         model.load_state_dict(sd, strict=True)
