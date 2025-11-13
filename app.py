@@ -70,11 +70,19 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
     model_name = model_name.lower()
 
     # --- construir el modelo correcto ---
-    if model_name == "resnet50":
-        model = tvm.resnet50(weights=None)
+    from models.cnn_basica_def import CNNSimple
+
+    # si las llaves contienen 'f.' o 'c.', se asume CNN personalizada
+    if any(k.startswith(("f.","c.")) for k in sd.keys()):
+        model = CNNSimple(num_classes=num_classes)
+        model_name = "cnn_basica"
     else:
-        model = tvm.resnet18(weights=None)
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
+        if model_name == "resnet50":
+            model = tvm.resnet50(weights=None)
+        else:
+            model = tvm.resnet18(weights=None)
+        model.fc = nn.Linear(model.fc.in_features, num_classes)
+
 
     # --- cargar pesos: primero estricto; si falla, no estricto y reporta ---
     warn = None
