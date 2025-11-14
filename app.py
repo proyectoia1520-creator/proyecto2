@@ -83,15 +83,30 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
 
     sd = strip_prefixes(sd)
 
-    # decidir arquitectura y construir modelo
-    from models.cnn_basica_def import CNNSimple
-
-    # si aparecen llaves con 'f.' o 'c.' asumimos tu CNN
-    is_custom = (model_name == "cnn_basica") or any(
-        k.startswith(("f.", "c.")) for k in sd.keys()
+    # -------------------------
+    # DETECCION REAL DE ARQUITECTURA POR LLAVES
+    # -------------------------
+    has_f_c_keys = any(
+        k.startswith(("f.", "c.", "f0.", "f3.", "f6.", "f9.", "c3."))
+        for k in sd.keys()
+    )
+    has_resnet_layers = any(
+        k.startswith("layer1.") or k.startswith("conv1.") for k in sd.keys()
+    )
+    has_conv_fc_seq = any(
+        k.startswith("conv.") or k.startswith("fc.") for k in sd.keys()
     )
 
+    # tu CNNSimple SOLO si realmente hay llaves f*/c*
+    is_custom = has_f_c_keys and not has_resnet_layers
+
+    # -------------------------
+    # decidir arquitectura y construir modelo
+    # -------------------------
+    from models.cnn_basica_def import CNNSimple
+
     if is_custom:
+        # ---------- CNNSimple (tu cnn_basica_def) ----------
         model = CNNSimple(num_classes=num_classes)
         # remap f.<num>.* -> f<num>.*  y c.<num>.* -> c<num>.*
         fixed = {}
@@ -101,12 +116,25 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
             fixed[(f"{m.group(1)}{m.group(2)}.{m.group(3)}" if m else k)] = v
         sd = fixed
         model_name = "cnn_basica"
+
     else:
-        # RESNET: exactamente como lo tenias
-        if model_name == "resnet50":
-            model = tvm.resnet50(weights=None)
+        # ---------- RESNET (igual que tu codigo original) ----------
+        # Si el state_dict tiene capas de ResNet, lo tratamos como resnet,
+        # aunque arch diga "cnn_basica".
+        if has_resnet_layers or model_name.startswith("resnet"):
+            # escogemos resnet50 o resnet18 segun nombre, como antes
+            if "50" in model_name:
+                model = tvm.resnet50(weights=None)
+                model_name = "resnet50"
+            else:
+                model = tvm.resnet18(weights=None)
+                model_name = "resnet18"
         else:
+            # fallback: si no es CNNSimple ni tiene capas de ResNet,
+            # usamos resnet18 como antes (pero ojo que ese ckpt puede no cuadrar)
             model = tvm.resnet18(weights=None)
+            model_name = "resnet18_fallback"
+
         model.fc = nn.Linear(model.fc.in_features, num_classes)
 
     # --- NORMALIZAR LLAVES DE LA CABEZA FC PARA RESNET (igual que original) ---
@@ -122,6 +150,7 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
             return fixed
         return sd
 
+    # solo tiene efecto si hay llaves fc.* de resnet
     sd = remap_resnet_fc_keys(sd)
 
     # cargar pesos (estricto; si falla, no estricto + warning)
