@@ -12,7 +12,7 @@ import streamlit as st
 
 
 # ----------------------------------------------------------
-# MODELO 1: CNNSimple (el tuyo clásico con f0, f3, f6, f9)
+# MODELO 1: CNNSimple (tu version con f0, f3, f6, f9)
 # ----------------------------------------------------------
 class CNNSimple(nn.Module):
     def __init__(self, num_classes=5):
@@ -36,7 +36,7 @@ class CNNSimple(nn.Module):
 
 
 # ----------------------------------------------------------
-# MODELO 2: CNNSequential (el que coincide con TUS MODELOS NUEVOS)
+# MODELO 2: CNNSequential (coincide con checkpoints con conv.* y fc.*)
 # ----------------------------------------------------------
 class CNNSequential(nn.Module):
     def __init__(self, num_classes=5):
@@ -74,15 +74,16 @@ st.title("🫁 Pulmo-ML Viewer - clasificacion pulmonar")
 
 
 # ----------------------------------------------------------
-# LOAD CHECKPOINT WITH AUTO-DETECT ARCHITECTURE
+# LOAD CHECKPOINT (ROBUSTO)
 # ----------------------------------------------------------
 @st.cache_resource
 def load_ckpt(ckpt_path: Path):
     import re
+
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
     # -----------------------------
-    # Clases del checkpoint o fallback
+    # fallback de clases
     # -----------------------------
     DEFAULT_CLASSES = [
         "bacterial_pneumonia",
@@ -95,14 +96,13 @@ def load_ckpt(ckpt_path: Path):
     classes = ckpt.get("classes")
 
     if classes is None:
+        # intentar classes.txt
         cl_path = ckpt_path.parent / "classes.txt"
         if cl_path.exists():
             with open(cl_path, "r", encoding="utf-8") as f:
                 classes = [line.strip() for line in f.readlines() if line.strip()]
         else:
-            classes = DEFAULT_CLASSES
-
-    num_classes = len(classes)
+            classes = None  # por ahora
 
     # -------------------------------------------
     # Obtener state_dict real del checkpoint
@@ -114,7 +114,7 @@ def load_ckpt(ckpt_path: Path):
         or ckpt
     )
     if not isinstance(sd, dict):
-        raise ValueError("No se encontró un dict de pesos.")
+        raise ValueError("No se encontró un dict de pesos en el checkpoint.")
 
     # -------------------------------------------
     # Limpieza de prefijos
@@ -132,46 +132,92 @@ def load_ckpt(ckpt_path: Path):
     sd = strip_prefixes(sd)
 
     # -------------------------------------------
+    # Detectar num_classes a partir de los pesos
+    # -------------------------------------------
+    def num_classes_from_sd(sd_dict):
+        for key in sd_dict:
+            if key.endswith("c3.weight") or key.endswith("fc.2.weight") or key == "fc.weight":
+                return sd_dict[key].shape[0]
+        # fallback si no encontramos cabeza
+        return len(classes) if classes is not None else len(DEFAULT_CLASSES)
+
+    num_classes = num_classes_from_sd(sd)
+
+    # Ajustar lista de clases final, sin romper nada
+    if classes is None:
+        # usamos default recortado o extendido
+        if num_classes <= len(DEFAULT_CLASSES):
+            classes = DEFAULT_CLASSES[:num_classes]
+        else:
+            classes = DEFAULT_CLASSES + [f"class_{i}" for i in range(len(DEFAULT_CLASSES), num_classes)]
+    else:
+        # si hay mismatch entre len(classes) y num_classes, recortamos o rellenamos
+        if len(classes) > num_classes:
+            classes = classes[:num_classes]
+        elif len(classes) < num_classes:
+            classes = classes + [f"class_{i}" for i in range(len(classes), num_classes)]
+
+    # -------------------------------------------
     # AUTO-DETECTAR ARQUITECTURA
     # -------------------------------------------
-    is_sequential = any(k.startswith("conv.") or k.startswith("fc.") for k in sd.keys())
-    is_custom = any(k.startswith(("f.", "c.")) for k in sd.keys())
+    has_resnet_layers = any(
+        k.startswith("layer1.") or k.startswith("conv1.") for k in sd.keys()
+    )
+    has_sequential_keys = any(k.startswith("conv.") or k.startswith("fc.") for k in sd.keys())
+    has_custom_keys = any(k.startswith(("f0.", "f3.", "f6.", "f9.", "c3.")) or k.startswith(("f.", "c.")) for k in sd.keys())
 
-    # --- MODELO NUEVO: CNNSequential ---
-    if is_sequential:
+    arch_meta = (ckpt.get("arch") or (ckpt.get("args", {}) or {}).get("model") or "").lower()
+
+    # --- RESNET ---
+    if has_resnet_layers or arch_meta.startswith("resnet"):
+        if "resnet50" in arch_meta:
+            model = tvm.resnet50(weights=None)
+            model_name = "resnet50"
+        else:
+            model = tvm.resnet18(weights=None)
+            model_name = "resnet18"
+        # ajustar cabeza
+        model.fc = nn.Linear(model.fc.in_features, num_classes)
+
+    # --- CNNSequential (conv.* y fc.*) ---
+    elif has_sequential_keys:
         model = CNNSequential(num_classes=num_classes)
         model_name = "cnn_sequential"
 
-    # --- MODELO ANTIGUO: CNNSimple ---
-    elif is_custom:
-        # remap f.X → fX
+    # --- CNNSimple (f0,f3,f6,f9,c3) ---
+    elif has_custom_keys or arch_meta.startswith("cnn"):
+        # remap f.X → fX si fuera necesario
         fixed = {}
         pat = re.compile(r"^(f|c)\.(\d+)\.(.+)$")
         for k, v in sd.items():
             m = pat.match(k)
-            fixed[(f"{m.group(1)}{m.group(2)}.{m.group(3)}" if m else k)] = v
+            if m:
+                nk = f"{m.group(1)}{m.group(2)}.{m.group(3)}"
+            else:
+                nk = k
+            fixed[nk] = v
         sd = fixed
         model = CNNSimple(num_classes=num_classes)
         model_name = "cnn_basica"
 
-    # --- RESNET ---
+    # --- Fallback: resnet18 ---
     else:
-        arch = (ckpt.get("arch") or "").lower()
-        if arch == "resnet50":
-            model = tvm.resnet50(weights=None)
-        else:
-            model = tvm.resnet18(weights=None)
+        model = tvm.resnet18(weights=None)
         model.fc = nn.Linear(model.fc.in_features, num_classes)
-        model_name = arch or "resnet"
+        model_name = "resnet18_fallback"
 
     # -------------------------------------------
-    # Cargar pesos
+    # Cargar pesos (permitiendo missing/unexpected)
     # -------------------------------------------
     try:
         model.load_state_dict(sd, strict=True)
-    except:
-        warn = model.load_state_dict(sd, strict=False)
-        model.__load_warnings__ = warn
+    except Exception:
+        try:
+            warn = model.load_state_dict(sd, strict=False)
+            model.__load_warnings__ = warn
+        except Exception:
+            # ultimo recurso: modelo con pesos random, pero sin romper la app
+            model.__load_warnings__ = "no se pudieron cargar todos los pesos (modelo inicializado aleatoriamente)"
 
     model.eval()
     return model, classes, model_name
@@ -208,7 +254,7 @@ def last_conv_layer(model):
 def gradcam(model, x):
     layer = last_conv_layer(model)
     if layer is None:
-        raise RuntimeError("No conv layer for grad-cam.")
+        raise RuntimeError("No se encontro una capa conv para grad-cam.")
 
     activations = []
     gradients = []
@@ -222,13 +268,14 @@ def gradcam(model, x):
     h1 = layer.register_forward_hook(fwd)
     h2 = layer.register_full_backward_hook(bwd)
 
+    model.zero_grad()
     out = model(x)
     pred_idx = int(out.argmax(1).item())
     out[0, pred_idx].backward()
 
-    a = activations[-1][0]
-    g = gradients[-1][0]
-    w = g.mean(dim=(1, 2))
+    a = activations[-1][0]      # (C,H,W)
+    g = gradients[-1][0]        # (C,H,W)
+    w = g.mean(dim=(1, 2))      # (C,)
 
     cam = (w[:, None, None] * a).sum(0).clamp(min=0)
     cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
@@ -250,7 +297,9 @@ available_models = sorted([p.name for p in models_dir.glob("*.pt")])
 # SIDEBAR CONFIG
 # ----------------------------------------------------------
 st.sidebar.header("config")
-model_file = st.sidebar.selectbox("modelo (.pt)", available_models)
+if not available_models:
+    st.sidebar.warning("no hay archivos .pt en carpeta 'models/'")
+model_file = st.sidebar.selectbox("modelo (.pt)", available_models) if available_models else None
 img_size = st.sidebar.slider("input size", 128, 1024, 384, 32)
 use_imagenet = st.sidebar.checkbox("imagenet norm", True)
 top_k = st.sidebar.slider("top-k", 1, 10, 5)
@@ -272,25 +321,33 @@ with col1:
 
 with col2:
     st.subheader("modelo")
+    model = None
+    classes = None
+    model_name = None
     if model_file:
-        model, classes, model_name = load_ckpt(models_dir / model_file)
-        st.success(f"modelo detectado: {model_name}")
-        st.write("clases:", classes)
-
+        try:
+            model, classes, model_name = load_ckpt(models_dir / model_file)
+            st.success(f"modelo detectado: {model_name}")
+            st.write("clases:", classes)
+            warn = getattr(model, "__load_warnings__", None)
+            if warn:
+                st.info(f"aviso carga pesos: {warn}")
+        except Exception as e:
+            st.error(f"error al cargar modelo: {e}")
 
 st.markdown("---")
 
-if img_pil is not None:
+if img_pil is not None and model is not None:
     x = preprocess(img_pil, img_size, use_imagenet)
     with torch.no_grad():
         logits = model(x)
         probs = torch.softmax(logits, 1)[0].cpu().numpy()
 
     idx = int(np.argmax(probs))
-    pred_label = classes[idx]
+    pred_label = classes[idx] if classes else f"clase_{idx}"
 
     st.subheader("resultado")
-    st.success(f"predicción: {pred_label} (indice {idx})")
+    st.success(f"prediccion: {pred_label} (indice {idx})")
 
     order = np.argsort(probs)[::-1][:top_k]
     topk = {classes[i]: float(probs[i]) for i in order}
@@ -313,6 +370,10 @@ if img_pil is not None:
             )
             overlay = (0.5 * img_arr + 0.5 * heat).clip(0, 255).astype("uint8")
             st.image(overlay, caption="grad-cam", use_column_width=True)
-
         except Exception as e:
-            st.error(str(e))
+            st.error(f"error en grad-cam: {e}")
+else:
+    if model is None:
+        st.info("selecciona un modelo .pt")
+    if img_pil is None:
+        st.info("sube una imagen para predecir")
