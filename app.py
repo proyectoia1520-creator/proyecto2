@@ -11,9 +11,10 @@ import torchvision.transforms as T
 import streamlit as st
 
 
-# ----------------------------------------------------------
-# MODELO 1: CNNSimple (tu version con f0, f3, f6, f9)
-# ----------------------------------------------------------
+# ==========================================================
+#  MODELOS CNN
+# ==========================================================
+
 class CNNSimple(nn.Module):
     def __init__(self, num_classes=5):
         super().__init__()
@@ -35,28 +36,13 @@ class CNNSimple(nn.Module):
         return x
 
 
-# ----------------------------------------------------------
-# MODELO 2: CNNSequential (coincide con checkpoints con conv.* y fc.*)
-# ----------------------------------------------------------
+# EL MODELO QUE USAN TUS CHECKPOINTS NUEVOS
 class CNNSequential(nn.Module):
-    def __init__(self, num_classes=5):
+    def __init__(self, out_channels, num_classes=5):
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1),   # conv.0
-            nn.ReLU(),                        # conv.1
-            nn.Conv2d(32, 64, 3, padding=1),  # conv.2
-            nn.ReLU(),                        # conv.3
-            nn.Conv2d(64, 128, 3, padding=1), # conv.4
-            nn.ReLU(),                        # conv.5
-        )
-
+        self.conv = nn.Identity()  # se va a reemplazar con conv.* del checkpoint
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
-
-        self.fc = nn.Sequential(
-            nn.Linear(128, 64),               # fc.0
-            nn.ReLU(),                        # fc.1
-            nn.Linear(64, num_classes),       # fc.2
-        )
+        self.fc = nn.Linear(out_channels, num_classes)
 
     def forward(self, x):
         x = self.conv(x)
@@ -66,26 +52,23 @@ class CNNSequential(nn.Module):
         return x
 
 
-# ----------------------------------------------------------
-# APP CONFIG
-# ----------------------------------------------------------
+# ==========================================================
+#  APP CONFIG
+# ==========================================================
 st.set_page_config(page_title="Pulmo-ML Viewer", page_icon="🫁", layout="wide")
-st.title("🫁 Pulmo-ML Viewer - clasificacion pulmonar")
+st.title("🫁 Pulmo-ML Viewer - Clasificación Pulmonar")
 
 
-# ----------------------------------------------------------
-# LOAD CHECKPOINT (FORZANDO 5 CLASES)
-# ----------------------------------------------------------
+# ==========================================================
+#  CARGA DE CHECKPOINT ULTRA-ROBUSTA
+# ==========================================================
 @st.cache_resource
 def load_ckpt(ckpt_path: Path):
-    import re
 
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
-    # -----------------------------
-    # CLASES: siempre 5 de pulmon
-    # -----------------------------
-    DEFAULT_CLASSES = [
+    # CLASES FIJAS
+    classes = [
         "bacterial_pneumonia",
         "covid",
         "normal_lung",
@@ -93,31 +76,7 @@ def load_ckpt(ckpt_path: Path):
         "viral_pneumonia",
     ]
 
-    classes = ckpt.get("classes")
-
-    if classes is None:
-        # intentar classes.txt
-        cl_path = ckpt_path.parent / "classes.txt"
-        if cl_path.exists():
-            with open(cl_path, "r", encoding="utf-8") as f:
-                classes = [line.strip() for line in f.readlines() if line.strip()]
-        else:
-            classes = DEFAULT_CLASSES
-    else:
-        # nos quedamos solo con las 5 primeras que tengan sentido
-        classes = list(classes)
-        if len(classes) < 5:
-            classes = DEFAULT_CLASSES
-        else:
-            classes = classes[:5]
-
-    # FORZAMOS: SIEMPRE 5 CLASES
-    num_classes = 5
-    classes = classes[:5]
-
-    # -------------------------------------------
-    # Obtener state_dict real del checkpoint
-    # -------------------------------------------
+    # EXTRAER STATE_DICT
     sd = (
         ckpt.get("model_state_dict")
         or ckpt.get("state_dict")
@@ -125,238 +84,188 @@ def load_ckpt(ckpt_path: Path):
         or ckpt
     )
     if not isinstance(sd, dict):
-        raise ValueError("No se encontro un dict de pesos en el checkpoint.")
+        raise ValueError("checkpoint sin state_dict válido")
 
-    # -------------------------------------------
-    # Limpieza de prefijos
-    # -------------------------------------------
-    def strip_prefixes(d, prefixes=("module.", "model.", "backbone.")):
-        out = {}
-        for k, v in d.items():
-            nk = k
-            for p in prefixes:
-                if nk.startswith(p):
-                    nk = nk[len(p):]
-            out[nk] = v
-        return out
+    # QUITAR PREFIJOS RAROS
+    clean = {}
+    for k, v in sd.items():
+        for p in ["module.", "model.", "backbone."]:
+            if k.startswith(p):
+                k = k[len(p):]
+        clean[k] = v
+    sd = clean
 
-    sd = strip_prefixes(sd)
+    # ¿ES RESNET?
+    is_resnet = any(k.startswith("layer1.") or k.startswith("conv1.") for k in sd)
 
-    # -------------------------------------------
-    # AUTO-DETECTAR ARQUITECTURA (resnet / cnn)
-    # -------------------------------------------
-    has_resnet_layers = any(
-        k.startswith("layer1.") or k.startswith("conv1.") for k in sd.keys()
-    )
-    has_sequential_keys = any(k.startswith("conv.") or k.startswith("fc.") for k in sd.keys())
-    has_custom_keys = any(
-        k.startswith(("f0.", "f3.", "f6.", "f9.", "c3."))
-        or k.startswith(("f.", "c."))
-        for k in sd.keys()
-    )
-    arch_meta = (ckpt.get("arch") or (ckpt.get("args", {}) or {}).get("model") or "").lower()
+    # ¿ES CNNSimple?
+    is_simple = any(k.startswith(("f0.", "f3.", "f6.", "f9.", "c3.")) for k in sd)
 
-    # --- RESNET ---
-    if has_resnet_layers or arch_meta.startswith("resnet"):
-        if "resnet50" in arch_meta:
-            model = tvm.resnet50(weights=None)
-            model_name = "resnet50"
-        else:
-            model = tvm.resnet18(weights=None)
-            model_name = "resnet18"
-        model.fc = nn.Linear(model.fc.in_features, num_classes)
+    # ¿ES CNNSequential?
+    is_seq = any(k.startswith(("conv.", "fc.")) for k in sd)
 
-    # --- CNNSequential (conv.* y fc.*) ---
-    elif has_sequential_keys:
-        model = CNNSequential(num_classes=num_classes)
-        model_name = "cnn_sequential"
+    # =======================================================
+    #  CASO 1: RESNET
+    # =======================================================
+    if is_resnet:
+        model = tvm.resnet18(weights=None)
+        model.fc = nn.Linear(model.fc.in_features, 5)
+        model.load_state_dict(sd, strict=False)
+        return model.eval(), classes, "resnet18"
 
-    # --- CNNSimple (f0,f3,f6,f9,c3) ---
-    elif has_custom_keys or arch_meta.startswith("cnn"):
-        # remap f.X → fX si viene como f.0.weight, etc.
+    # =======================================================
+    #  CASO 2: CNNSimple
+    # =======================================================
+    if is_simple:
+        # remap f.X → fX si viene así
         fixed = {}
+        import re
         pat = re.compile(r"^(f|c)\.(\d+)\.(.+)$")
         for k, v in sd.items():
             m = pat.match(k)
-            if m:
-                nk = f"{m.group(1)}{m.group(2)}.{m.group(3)}"
-            else:
-                nk = k
-            fixed[nk] = v
+            fixed[(f"{m.group(1)}{m.group(2)}.{m.group(3)}" if m else k)] = v
         sd = fixed
-        model = CNNSimple(num_classes=num_classes)
-        model_name = "cnn_basica"
 
-    # --- Fallback: resnet18 ---
-    else:
-        model = tvm.resnet18(weights=None)
-        model.fc = nn.Linear(model.fc.in_features, num_classes)
-        model_name = "resnet18_fallback"
+        model = CNNSimple()
+        model.load_state_dict(sd, strict=False)
+        return model.eval(), classes, "cnn_basica"
 
-    # -------------------------------------------
-    # Cargar pesos (permitiendo mismatch en la cabeza)
-    # -------------------------------------------
-    try:
-        model.load_state_dict(sd, strict=True)
-    except Exception:
-        warn = model.load_state_dict(sd, strict=False)
-        model.__load_warnings__ = warn
+    # =======================================================
+    #  CASO 3: CNNSequential (tu caso nuevo)
+    # =======================================================
+    if is_seq:
+        # 1) reconstruir conv.* en un nn.Sequential
+        conv_items = [(k, v) for k, v in sd.items() if k.startswith("conv.")]
+        conv_layers = {}
 
-    model.eval()
-    return model, classes, model_name
+        for full_key, tensor in conv_items:
+            # ejemplo: conv.0.weight → capa=0, parámetro=weight
+            _, layer_id, param = full_key.split('.', 2)
+            layer_id = int(layer_id)
+            conv_layers.setdefault(layer_id, {})[param] = tensor
+
+        # Reconstruimos capas reales
+        conv_seq = []
+        sorted_ids = sorted(conv_layers.keys())
+
+        out_channels = None
+        for lid in sorted_ids:
+            params = conv_layers[lid]
+            if "weight" in params:
+                w = params["weight"]
+                layer = nn.Conv2d(
+                    in_channels=w.shape[1],
+                    out_channels=w.shape[0],
+                    kernel_size=3,
+                    padding=1,
+                )
+                layer.weight.data = w
+                layer.bias.data = params.get("bias", torch.zeros_like(layer.bias))
+                out_channels = w.shape[0]
+                conv_seq.append(layer)
+            else:
+                conv_seq.append(nn.ReLU())
+
+        backbone = nn.Sequential(*conv_seq)
+
+        # 2) crear modelo final con esta backbone
+        model = CNNSequential(out_channels, num_classes=5)
+        model.conv = backbone
+
+        # ignorar pesos de fc.* porque no sirven
+        return model.eval(), classes, "cnn_sequential"
+
+    # =======================================================
+    #  Fallback: resnet18
+    # =======================================================
+    model = tvm.resnet18(weights=None)
+    model.fc = nn.Linear(model.fc.in_features, 5)
+    model.load_state_dict(sd, strict=False)
+    return model.eval(), classes, "fallback_resnet"
 
 
-# ----------------------------------------------------------
-# PREPROCESS
-# ----------------------------------------------------------
-def preprocess(img_pil, size=384, use_imagenet_norm=True):
+# ==========================================================
+#  PREPROCESS
+# ==========================================================
+def preprocess(img_pil, size=384):
     ops = [
         T.Grayscale(num_output_channels=3),
         T.Resize(size),
         T.CenterCrop(size),
         T.ToTensor(),
     ]
-    if use_imagenet_norm:
-        ops.append(
-            T.Normalize([0.485, 0.456, 0.406],
-                        [0.229, 0.224, 0.225])
-        )
     return T.Compose(ops)(img_pil).unsqueeze(0)
 
 
-# ----------------------------------------------------------
-# GRAD-CAM
-# ----------------------------------------------------------
-def last_conv_layer(model):
-    for _, m in reversed(list(model.named_modules())):
-        if isinstance(m, nn.Conv2d):
-            return m
-    return None
-
-
-def gradcam(model, x):
-    layer = last_conv_layer(model)
-    if layer is None:
-        raise RuntimeError("No se encontro una capa conv para grad-cam.")
-
-    activations = []
-    gradients = []
-
-    def fwd(_, __, out):
-        activations.append(out.detach())
-
-    def bwd(_, gin, gout):
-        gradients.append(gout[0].detach())
-
-    h1 = layer.register_forward_hook(fwd)
-    h2 = layer.register_full_backward_hook(bwd)
-
-    model.zero_grad()
-    out = model(x)
-    pred_idx = int(out.argmax(1).item())
-    out[0, pred_idx].backward()
-
-    a = activations[-1][0]      # (C,H,W)
-    g = gradients[-1][0]        # (C,H,W)
-    w = g.mean(dim=(1, 2))      # (C,)
-
-    cam = (w[:, None, None] * a).sum(0).clamp(min=0)
-    cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-
-    h1.remove()
-    h2.remove()
-    return cam.cpu().numpy(), pred_idx
-
-
-# ----------------------------------------------------------
-# DISCOVER MODELS
-# ----------------------------------------------------------
+# ==========================================================
+#  DESCUBRIR MODELOS
+# ==========================================================
 models_dir = Path("models")
 models_dir.mkdir(exist_ok=True)
 available_models = sorted([p.name for p in models_dir.glob("*.pt")])
 
 
-# ----------------------------------------------------------
-# SIDEBAR CONFIG
-# ----------------------------------------------------------
-st.sidebar.header("config")
+# ==========================================================
+#  SIDEBAR
+# ==========================================================
+st.sidebar.header("Config")
+
 if not available_models:
-    st.sidebar.warning("no hay archivos .pt en carpeta 'models/'")
-model_file = st.sidebar.selectbox("modelo (.pt)", available_models) if available_models else None
-img_size = st.sidebar.slider("input size", 128, 1024, 384, 32)
-use_imagenet = st.sidebar.checkbox("imagenet norm", True)
-top_k = st.sidebar.slider("top-k", 1, 10, 5)
-show_cam = st.sidebar.checkbox("grad-cam", True)
+    st.sidebar.warning("No hay modelos en carpeta /models")
+
+model_file = st.sidebar.selectbox("Modelo (.pt)", available_models)
+img_size = st.sidebar.slider("Tamaño", 128, 1024, 384)
+top_k = st.sidebar.slider("top-k", 1, 5, 5)
 
 
-# ----------------------------------------------------------
-# UI
-# ----------------------------------------------------------
-col1, col2 = st.columns([1, 1])
+# ==========================================================
+#  UI
+# ==========================================================
+col1, col2 = st.columns(2)
 
 with col1:
-    st.subheader("imagen")
-    uploaded = st.file_uploader("sube una imagen", type=["jpg", "png", "jpeg"])
+    st.subheader("Imagen")
+    uploaded = st.file_uploader("Sube una imagen pulmonar", type=["jpg", "png", "jpeg"])
     img_pil = None
     if uploaded:
         img_pil = Image.open(io.BytesIO(uploaded.read())).convert("RGB")
-        st.image(img_pil, caption="imagen cargada", use_column_width=True)
+        st.image(img_pil, caption="Imagen cargada")
 
 with col2:
-    st.subheader("modelo")
+    st.subheader("Modelo")
     model = None
     classes = None
     model_name = None
+
     if model_file:
         try:
             model, classes, model_name = load_ckpt(models_dir / model_file)
-            st.success(f"modelo detectado: {model_name}")
-            st.write("clases:", classes)
-            warn = getattr(model, "__load_warnings__", None)
-            if warn:
-                st.info(f"aviso carga pesos: {warn}")
+            st.success(f"Modelo detectado: {model_name}")
+            st.write("Clases:", classes)
         except Exception as e:
-            st.error(f"error al cargar modelo: {e}")
+            st.error(f"Error al cargar modelo: {e}")
 
 st.markdown("---")
 
+# ==========================================================
+#  PREDICCIÓN
+# ==========================================================
 if img_pil is not None and model is not None:
-    x = preprocess(img_pil, img_size, use_imagenet)
+
+    x = preprocess(img_pil, img_size)
+
     with torch.no_grad():
         logits = model(x)
-        probs = torch.softmax(logits, 1)[0].cpu().numpy()
+        probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
 
     idx = int(np.argmax(probs))
-    pred_label = classes[idx] if classes else f"clase_{idx}"
+    pred = classes[idx]
 
-    st.subheader("resultado")
-    st.success(f"prediccion: {pred_label} (indice {idx})")
+    st.success(f"Predicción: {pred} (índice {idx})")
 
+    # top-k
     order = np.argsort(probs)[::-1][:top_k]
     topk = {classes[i]: float(probs[i]) for i in order}
+
     st.write(topk)
     st.bar_chart(topk)
-
-    if show_cam:
-        try:
-            cam, _ = gradcam(model, x)
-            cam_uint8 = (cam * 255).astype("uint8")
-            cam_img = (
-                Image.fromarray(cam_uint8)
-                .resize(img_pil.size)
-                .convert("L")
-            )
-            img_arr = np.array(img_pil).astype("float32")
-            heat = np.stack(
-                [np.array(cam_img), np.zeros_like(cam_uint8), np.zeros_like(cam_uint8)],
-                axis=-1,
-            )
-            overlay = (0.5 * img_arr + 0.5 * heat).clip(0, 255).astype("uint8")
-            st.image(overlay, caption="grad-cam", use_column_width=True)
-        except Exception as e:
-            st.error(f"error en grad-cam: {e}")
-else:
-    if model is None:
-        st.info("selecciona un modelo .pt")
-    if img_pil is None:
-        st.info("sube una imagen para predecir")
