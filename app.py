@@ -27,7 +27,7 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
     # -------------------------
-    # clases (mismo comportamiento original + fallback)
+    # clases (mismo comportamiento original + fallback suave)
     # -------------------------
     DEFAULT_CLASSES = [
         "bacterial_pneumonia",
@@ -77,7 +77,7 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
             nk = k
             for p in prefixes:
                 if nk.startswith(p):
-                    nk = nk[len(p) :]
+                    nk = nk[len(p):]
             out[nk] = v
         return out
 
@@ -95,7 +95,7 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
         model = CNNSimple(num_classes=num_classes)
         # remap f.<num>.* -> f<num>.*  y c.<num>.* -> c<num>.*
         fixed = {}
-        pat = re.compile(r"^(f|c)\.(\d+)\.(.+)$')  # ej: f.3.weight -> f3.weight
+        pat = re.compile(r"^(f|c)\.(\d+)\.(.+)$")  # ej: f.3.weight -> f3.weight
         for k, v in sd.items():
             m = pat.match(k)
             fixed[(f"{m.group(1)}{m.group(2)}.{m.group(3)}" if m else k)] = v
@@ -116,7 +116,7 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
             fixed = {}
             for k, v in sd.items():
                 if k.startswith("fc.1."):
-                    fixed["fc." + k[len("fc.1.") :]] = v  # fc.1.weight -> fc.weight
+                    fixed["fc." + k[len("fc.1."):]] = v  # fc.1.weight -> fc.weight
                 elif not k.startswith("fc.0."):  # fc.0.* suele ser Dropout/ReLU sin params
                     fixed[k] = v
             return fixed
@@ -248,7 +248,7 @@ with col1:
     img_pil = None
     if uploaded is not None:
         img_pil = Image.open(io.BytesIO(uploaded.read())).convert("RGB")
-        st.image(img_pil, caption="imagen cargada", width="stretch")
+        st.image(img_pil, caption="imagen cargada", use_column_width=True)
 
 with col2:
     st.subheader("modelo")
@@ -282,8 +282,8 @@ with col2:
 st.markdown("---")
 
 if (img_pil is not None) and (model is not None):
-    # prediccion
     x = preprocess(img_pil, size=img_size, use_imagenet_norm=use_imagenet)
+
     with torch.no_grad():
         logits = model(x)
         if temp:
@@ -292,9 +292,10 @@ if (img_pil is not None) and (model is not None):
 
     idx = int(np.argmax(probs))
     pred_label = classes[idx] if classes else f"clase_{idx}"
+
     st.subheader("resultado")
     st.success(f"clase predicha: {pred_label}")
-    # top-k
+
     order = np.argsort(probs)[::-1][:top_k]
     topk_dict = {
         (classes[i] if classes else f"clase_{i}"): float(probs[i]) for i in order
@@ -302,7 +303,6 @@ if (img_pil is not None) and (model is not None):
     st.write(topk_dict)
     st.bar_chart(topk_dict)
 
-    # grad-cam
     if show_cam:
         try:
             cam, pred_idx = gradcam(model, x)
