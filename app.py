@@ -19,16 +19,47 @@ st.title("🫁 Pulmo-ML Viewer - clasificacion pulmonar")
 
 
 # ----------------------------
+# modelos para los checkpoints nuevos
+# ----------------------------
+class CNNBasicaSeq(nn.Module):
+    """
+    Misma arquitectura que la usada en el script de entrenamiento:
+    - 3 conv + maxpool
+    - 2 capas FC (256 -> nc)
+    """
+    def __init__(self, nc: int, im_size: int = 224):
+        super().__init__()
+        self.im_size = im_size
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64,128, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+        )
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(0.3),
+            nn.Linear(128 * (im_size//8) * (im_size//8), 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, nc)
+        )
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.fc(x)
+        return x
+
+
+# ----------------------------
 # utils
 # ----------------------------
 @st.cache_resource
 def load_ckpt(ckpt_path: Path, force_classes=None):
     import re
+
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
-    # -------------------------
-    # clases (comportamiento original + fallback suave)
-    # -------------------------
+    # -------- clases --------
     DEFAULT_CLASSES = [
         "bacterial_pneumonia",
         "covid",
@@ -37,40 +68,36 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
         "viral_pneumonia",
     ]
 
-    classes = force_classes if force_classes else ckpt.get("classes")
-
-    if not classes:
-        # si no hay 'classes' en el ckpt, intentamos buscar un classes.txt
+    def load_classes():
+        # 1) sidebar (override manual)
+        if force_classes:
+            return list(force_classes)
+        # 2) del checkpoint (formato viejo)
+        if isinstance(ckpt, dict) and "classes" in ckpt:
+            return list(ckpt["classes"])
+        # 3) classes.txt al costado del modelo
         classes_txt = ckpt_path.parent / "classes.txt"
         if classes_txt.exists():
             with open(classes_txt, "r", encoding="utf-8") as f:
-                classes = [line.strip() for line in f.readlines() if line.strip()]
-        else:
-            # ultimo recurso: usar el orden por defecto
-            classes = DEFAULT_CLASSES
+                return [line.strip() for line in f.readlines() if line.strip()]
+        # 4) fallback por defecto
+        return DEFAULT_CLASSES
 
+    classes = load_classes()
     num_classes = len(classes)
 
-    # -------------------------
-    # arquitectura (igual que tu codigo original)
-    # -------------------------
-    model_name = (
-        ckpt.get("arch")
-        or (ckpt.get("args", {}) or {}).get("model")
-        or "cnn_basica"
-    ).lower()
+    # -------- sacar state_dict crudo --------
+    if isinstance(ckpt, dict) and any(
+        k in ckpt for k in ("model_state_dict", "state_dict", "model")
+    ):
+        sd = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt.get("model")
+    else:
+        sd = ckpt
 
-    # state_dict crudo
-    sd = (
-        ckpt.get("model_state_dict")
-        or ckpt.get("state_dict")
-        or ckpt.get("model")
-        or ckpt
-    )
     if not isinstance(sd, dict):
         raise ValueError("No se encontro un dict de pesos en el checkpoint.")
 
-    # limpiar prefijos
+    # limpiar prefijos comunes
     def strip_prefixes(d, prefixes=("module.", "model.", "backbone.")):
         out = {}
         for k, v in d.items():
@@ -83,58 +110,85 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
 
     sd = strip_prefixes(sd)
 
-    # -------------------------
-    # deteccion de tipo de modelo por llaves
-    # -------------------------
-    has_f_c_keys = any(
-        k.startswith(("f.", "c.", "f0.", "f3.", "f6.", "f9.", "c3."))
-        for k in sd.keys()
+    # normalizar fc.* para resnets viejos (fc.1.* -> fc.*)
+    def remap_resnet_fc_keys(sd_in: dict):
+        if "fc.weight" not in sd_in and any(k.startswith("fc.1.") for k in sd_in.keys()):
+            fixed = {}
+            for k, v in sd_in.items():
+                if k.startswith("fc.1."):
+                    fixed["fc." + k[len("fc.1."):]] = v
+                elif not k.startswith("fc.0."):
+                    fixed[k] = v
+            return fixed
+        return sd_in
+
+    sd = remap_resnet_fc_keys(sd)
+
+    keys = list(sd.keys())
+
+    # -------- detectar tipo de modelo por llaves --------
+    has_old_cnn = any(
+        k.startswith(("f0.", "f3.", "f6.", "f9.", "c3.", "f.", "c."))
+        for k in keys
     )
-    has_resnet_layers = any(
-        k.startswith("layer1.") or k.startswith("conv1.") for k in sd.keys()
-    )
+    has_seq_cnn = any(k.startswith("conv.") for k in keys) and any(
+        k.startswith("fc.") for k in keys
+    ) and not any(k.startswith("layer1.") for k in keys)
+    has_resnet = any(k.startswith("layer1.") for k in keys) or "fc.weight" in sd
 
-    # tu CNNSimple SOLO si realmente hay llaves f*/c*
-    is_custom = has_f_c_keys
+    # -------- construir modelo segun tipo --------
+    model = None
+    model_name = "desconocido"
 
-    # decidir arquitectura y construir modelo
-    from models.cnn_basica_def import CNNSimple
+    if has_old_cnn:
+        # CNN antigua (CNNSimple con f0,f3,f6,f9,c3)
+        from models.cnn_basica_def import CNNSimple
 
-    if is_custom:
-        # ---------- CNNSimple (tu cnn_basica_def) ----------
         model = CNNSimple(num_classes=num_classes)
+
         # remap f.<num>.* -> f<num>.*  y c.<num>.* -> c<num>.*
         fixed = {}
-        pat = re.compile(r"^(f|c)\.(\d+)\.(.+)$")  # ej: f.3.weight -> f3.weight
+        pat = re.compile(r"^(f|c)\.(\d+)\.(.+)$")
         for k, v in sd.items():
             m = pat.match(k)
             fixed[(f"{m.group(1)}{m.group(2)}.{m.group(3)}" if m else k)] = v
         sd = fixed
+        model_name = "cnn_basica_old"
+
+    elif has_seq_cnn:
+        # CNNBasica nueva (conv.0 / conv.3 / conv.6 + fc.*)
+        model = CNNBasicaSeq(nc=num_classes, im_size=224)
         model_name = "cnn_basica"
-    else:
-        # ---------- RESNET (igual que tu codigo original) ----------
-        if model_name == "resnet50":
-            model = tvm.resnet50(weights=None)
+
+    elif has_resnet:
+        # ResNet (18 o 50) segun dimension de fc.weight
+        fc_in = None
+        fc_out = num_classes
+        if "fc.weight" in sd:
+            fc_weight = sd["fc.weight"]
+            if fc_weight.ndim == 2:
+                fc_out, fc_in = fc_weight.shape
+
+        if fc_in == 2048:
+            base = tvm.resnet50(weights=None)
+            model_name = "resnet50"
+        elif fc_in == 512:
+            base = tvm.resnet18(weights=None)
+            model_name = "resnet18"
         else:
-            model = tvm.resnet18(weights=None)
-        model.fc = nn.Linear(model.fc.in_features, num_classes)
+            # si no sabemos, asumimos resnet50 porque es lo que usaste en el script
+            base = tvm.resnet50(weights=None)
+            model_name = "resnet50?"
 
-        # --- NORMALIZAR LLAVES DE LA CABEZA FC PARA RESNET (igual que original) ---
-        def remap_resnet_fc_keys(sd_in: dict):
-            # Si el ckpt trae una cabeza secuencial (fc.1.*), mapeamos a fc.*
-            if "fc.weight" not in sd_in and any(k.startswith("fc.1.") for k in sd_in.keys()):
-                fixed2 = {}
-                for k2, v2 in sd_in.items():
-                    if k2.startswith("fc.1."):
-                        fixed2["fc." + k2[len("fc.1."):]] = v2  # fc.1.weight -> fc.weight
-                    elif not k2.startswith("fc.0."):  # fc.0.* suele ser Dropout/ReLU sin params
-                        fixed2[k2] = v2
-                return fixed2
-            return sd_in
+        base.fc = nn.Linear(base.fc.in_features, fc_out)
+        model = base
 
-        sd = remap_resnet_fc_keys(sd)
+    else:
+        raise RuntimeError(
+            f"No pude inferir el tipo de modelo a partir de las llaves: ejemplo {keys[:5]}"
+        )
 
-    # cargar pesos (estricto; si falla, no estricto + warning)
+    # -------- cargar pesos --------
     try:
         model.load_state_dict(sd, strict=True)
     except Exception:
@@ -145,15 +199,15 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
         model.__load_debug__ = {"missing_sample": miss, "unexpected_sample": unexp}
 
     model.eval()
-    temp = ckpt.get("temperature", None)
+    temp = ckpt.get("temperature", None) if isinstance(ckpt, dict) else None
     return model, classes, temp, model_name
 
 
-def preprocess(img_pil, size=384, use_imagenet_norm=True):
+def preprocess(img_pil, size=224, use_imagenet_norm=True):
+    # IMPORTANTE: que coincida con eval_tf del entrenamiento
+    # eval_tf = Resize((IM_SIZE, IM_SIZE)) + ToTensor + Normalize(...)
     ops = [
-        T.Grayscale(num_output_channels=3),
-        T.Resize(size),
-        T.CenterCrop(size),
+        T.Resize((size, size)),
         T.ToTensor(),
     ]
     if use_imagenet_norm:
@@ -234,7 +288,7 @@ model_file = (
     else None
 )
 img_size = st.sidebar.number_input(
-    "tamano de entrada (px)", min_value=128, max_value=1024, value=384, step=32
+    "tamano de entrada (px)", min_value=128, max_value=1024, value=224, step=32
 )
 use_imagenet = st.sidebar.checkbox("normalizacion imagenet", value=True)
 top_k = st.sidebar.slider("top-k", min_value=1, max_value=10, value=5)
