@@ -11,70 +11,25 @@ import torchvision.transforms as T
 import streamlit as st
 
 
-# ==========================================================
-#  MODELOS CNN
-# ==========================================================
-
-class CNNSimple(nn.Module):
-    def __init__(self, num_classes=5):
-        super().__init__()
-        self.f0 = nn.Conv2d(3, 32, 3, padding=1)
-        self.f3 = nn.Conv2d(32, 64, 3, padding=1)
-        self.f6 = nn.Conv2d(64, 128, 3, padding=1)
-        self.f9 = nn.Conv2d(128, 256, 3, padding=1)
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.c3 = nn.Linear(256, num_classes)
-
-    def forward(self, x):
-        x = torch.relu(self.f0(x))
-        x = torch.relu(self.f3(x))
-        x = torch.relu(self.f6(x))
-        x = torch.relu(self.f9(x))
-        x = self.pool(x)
-        x = torch.flatten(x, 1)
-        x = self.c3(x)
-        return x
-
-
-class CNNSequential(nn.Module):
-    """
-    Para checkpoints con conv.* y fc.* (tus CNN secuenciales antiguas).
-    Reconstruimos conv.* desde el checkpoint y usamos una fc nueva de 5 clases.
-    """
-    def __init__(self, out_channels, num_classes=5):
-        super().__init__()
-        self.conv = nn.Identity()  # se rellena luego
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(out_channels, num_classes)
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.pool(x)
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
-        return x
-
-
-# ==========================================================
-#  APP CONFIG
-# ==========================================================
+# ----------------------------
+# app config
+# ----------------------------
 st.set_page_config(page_title="Pulmo-ML Viewer", page_icon="🫁", layout="wide")
-st.title("🫁 Pulmo-ML Viewer - Clasificacion pulmonar")
+st.title("🫁 Pulmo-ML Viewer - clasificacion pulmonar")
 
 
-# ==========================================================
-#  CARGA DE CHECKPOINT
-# ==========================================================
+# ----------------------------
+# utils
+# ----------------------------
 @st.cache_resource
-def load_ckpt(ckpt_path: Path):
+def load_ckpt(ckpt_path: Path, force_classes=None):
     import re
-
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
-    # -----------------------------
-    # CLASES: siempre 5 de pulmon
-    # -----------------------------
-    CLASSES = [
+    # -------------------------
+    # clases (mismo comportamiento original + fallback)
+    # -------------------------
+    DEFAULT_CLASSES = [
         "bacterial_pneumonia",
         "covid",
         "normal_lung",
@@ -82,202 +37,165 @@ def load_ckpt(ckpt_path: Path):
         "viral_pneumonia",
     ]
 
-    # -------------------------------------------
-    # Obtener state_dict real del checkpoint
-    # -------------------------------------------
-    sd_raw = (
+    classes = force_classes if force_classes else ckpt.get("classes")
+
+    if not classes:
+        # si no hay 'classes' en el ckpt, intentamos buscar un classes.txt
+        classes_txt = ckpt_path.parent / "classes.txt"
+        if classes_txt.exists():
+            with open(classes_txt, "r", encoding="utf-8") as f:
+                classes = [line.strip() for line in f.readlines() if line.strip()]
+        else:
+            # ultimo recurso: usar el orden por defecto de tu dataset
+            classes = DEFAULT_CLASSES
+
+    num_classes = len(classes)
+
+    # -------------------------
+    # arquitectura (igual que tu codigo original)
+    # -------------------------
+    model_name = (
+        ckpt.get("arch")
+        or (ckpt.get("args", {}) or {}).get("model")
+        or "cnn_basica"
+    ).lower()
+
+    # state_dict crudo
+    sd = (
         ckpt.get("model_state_dict")
         or ckpt.get("state_dict")
         or ckpt.get("model")
         or ckpt
     )
-    if not isinstance(sd_raw, dict):
+    if not isinstance(sd, dict):
         raise ValueError("No se encontro un dict de pesos en el checkpoint.")
 
-    # -------------------------------------------
-    # Limpiar prefijos
-    # -------------------------------------------
+    # limpiar prefijos
     def strip_prefixes(d, prefixes=("module.", "model.", "backbone.")):
         out = {}
         for k, v in d.items():
             nk = k
             for p in prefixes:
                 if nk.startswith(p):
-                    nk = nk[len(p):]
+                    nk = nk[len(p) :]
             out[nk] = v
         return out
 
-    sd = strip_prefixes(sd_raw)
+    sd = strip_prefixes(sd)
 
-    # -------------------------------------------
-    # Quitar cualquier cabeza fc/classifier del state_dict
-    # (asi evitamos size mismatch en la ultima capa)
-    # -------------------------------------------
-    def remove_head_keys(d):
-        return {
-            k: v
-            for k, v in d.items()
-            if not (k.startswith("fc.") or k.startswith("classifier."))
-        }
+    # decidir arquitectura y construir modelo
+    from models.cnn_basica_def import CNNSimple
 
-    sd_nohead = remove_head_keys(sd)
-
-    # -------------------------------------------
-    # AUTO-DETECTAR ARQUITECTURA
-    # -------------------------------------------
-    has_resnet_layers = any(k.startswith("layer1.") for k in sd_nohead.keys())
-    has_custom_keys = any(
-        k.startswith(("f0.", "f3.", "f6.", "f9.", "c3."))
-        or k.startswith(("f.", "c."))
-        for k in sd_nohead.keys()
-    )
-    has_seq_keys = any(
-        k.startswith("conv.") or k.startswith("fc.") for k in sd_nohead.keys()
+    # si aparecen llaves con 'f.' o 'c.' asumimos tu CNN
+    is_custom = (model_name == "cnn_basica") or any(
+        k.startswith(("f.", "c.")) for k in sd.keys()
     )
 
-    arch_meta = (ckpt.get("arch") or (ckpt.get("args", {}) or {}).get("model") or "").lower()
-
-    # =====================================================
-    #  CASO 1: RESNET (asumimos SIEMPRE ResNet50 torchvision)
-    # =====================================================
-    if has_resnet_layers or "resnet" in arch_meta:
-        # usamos resnet50 siempre, porque tus pesos se ven de resnet50
-        backbone = tvm.resnet50(weights=None)
-        # nueva cabeza de 5 clases
-        backbone.fc = nn.Linear(backbone.fc.in_features, 5)
-
-        # cargamos solo las capas que calzan (sin fc.* en el dict → no hay size mismatch en la cabeza)
-        missing, unexpected = backbone.load_state_dict(sd_nohead, strict=False)
-        backbone.eval()
-        return backbone, CLASSES, "resnet50"
-
-    # =====================================================
-    #  CASO 2: CNNSimple (cnn_basica)
-    # =====================================================
-    if has_custom_keys or arch_meta.startswith("cnn"):
-        # remap f.X → fX si fuera necesario (f.0.weight → f0.weight)
+    if is_custom:
+        model = CNNSimple(num_classes=num_classes)
+        # remap f.<num>.* -> f<num>.*  y c.<num>.* -> c<num>.*
         fixed = {}
-        pat = re.compile(r"^(f|c)\.(\d+)\.(.+)$")
-        for k, v in sd_nohead.items():
+        pat = re.compile(r"^(f|c)\.(\d+)\.(.+)$')  # ej: f.3.weight -> f3.weight
+        for k, v in sd.items():
             m = pat.match(k)
-            if m:
-                nk = f"{m.group(1)}{m.group(2)}.{m.group(3)}"
-            else:
-                nk = k
-            fixed[nk] = v
+            fixed[(f"{m.group(1)}{m.group(2)}.{m.group(3)}" if m else k)] = v
+        sd = fixed
+        model_name = "cnn_basica"
+    else:
+        # RESNET: exactamente como lo tenias
+        if model_name == "resnet50":
+            model = tvm.resnet50(weights=None)
+        else:
+            model = tvm.resnet18(weights=None)
+        model.fc = nn.Linear(model.fc.in_features, num_classes)
 
-        model = CNNSimple(num_classes=5)
-        model.load_state_dict(fixed, strict=False)
-        model.eval()
-        return model, CLASSES, "cnn_basica"
+    # --- NORMALIZAR LLAVES DE LA CABEZA FC PARA RESNET (igual que original) ---
+    def remap_resnet_fc_keys(sd: dict):
+        # Si el ckpt trae una cabeza secuencial (fc.1.*), mapeamos a fc.*
+        if "fc.weight" not in sd and any(k.startswith("fc.1.") for k in sd.keys()):
+            fixed = {}
+            for k, v in sd.items():
+                if k.startswith("fc.1."):
+                    fixed["fc." + k[len("fc.1.") :]] = v  # fc.1.weight -> fc.weight
+                elif not k.startswith("fc.0."):  # fc.0.* suele ser Dropout/ReLU sin params
+                    fixed[k] = v
+            return fixed
+        return sd
 
-    # =====================================================
-    #  CASO 3: CNNSequential (conv.* / fc.*)
-    # =====================================================
-    if has_seq_keys:
-        # reconstruimos solo conv.*
-        conv_items = [(k, v) for k, v in sd_nohead.items() if k.startswith("conv.")]
-        conv_layers = {}
+    sd = remap_resnet_fc_keys(sd)
 
-        for full_key, tensor in conv_items:
-            # conv.0.weight -> capa 0, param weight
-            _, lid, param = full_key.split(".", 2)
-            lid = int(lid)
-            conv_layers.setdefault(lid, {})[param] = tensor
+    # cargar pesos (estricto; si falla, no estricto + warning)
+    try:
+        model.load_state_dict(sd, strict=True)
+    except Exception:
+        warn = model.load_state_dict(sd, strict=False)
+        model.__load_warnings__ = warn
+        miss = list(warn.missing_keys)[:10]
+        unexp = list(warn.unexpected_keys)[:10]
+        model.__load_debug__ = {"missing_sample": miss, "unexpected_sample": unexp}
 
-        conv_seq = []
-        sorted_ids = sorted(conv_layers.keys())
-        out_channels = None
-
-        for lid in sorted_ids:
-            params = conv_layers[lid]
-            if "weight" in params:
-                w = params["weight"]
-                kh, kw = w.shape[2], w.shape[3]
-                layer = nn.Conv2d(
-                    in_channels=w.shape[1],
-                    out_channels=w.shape[0],
-                    kernel_size=(kh, kw),
-                    padding=0 if (kh == 1 and kw == 1) else 1,
-                )
-                layer.weight.data = w
-                if "bias" in params:
-                    layer.bias.data = params["bias"]
-                else:
-                    nn.init.zeros_(layer.bias)
-                out_channels = w.shape[0]
-                conv_seq.append(layer)
-            else:
-                conv_seq.append(nn.ReLU())
-
-        if out_channels is None:
-            out_channels = 128  # fallback por si acaso
-
-        backbone = nn.Sequential(*conv_seq)
-        model = CNNSequential(out_channels=out_channels, num_classes=5)
-        model.conv = backbone
-        model.eval()
-        return model, CLASSES, "cnn_sequential"
-
-    # =====================================================
-    #  Fallback: resnet18 sin pesos (por si nada coincide)
-    # =====================================================
-    fallback = tvm.resnet18(weights=None)
-    fallback.fc = nn.Linear(fallback.fc.in_features, 5)
-    fallback.eval()
-    return fallback, CLASSES, "resnet18_fallback"
+    model.eval()
+    temp = ckpt.get("temperature", None)
+    return model, classes, temp, model_name
 
 
-# ==========================================================
-#  PREPROCESS
-# ==========================================================
-def preprocess(img_pil, size=384):
+def preprocess(img_pil, size=384, use_imagenet_norm=True):
     ops = [
         T.Grayscale(num_output_channels=3),
         T.Resize(size),
         T.CenterCrop(size),
         T.ToTensor(),
     ]
+    if use_imagenet_norm:
+        ops.append(
+            T.Normalize(
+                [0.485, 0.456, 0.406],
+                [0.229, 0.224, 0.225],
+            )
+        )
     return T.Compose(ops)(img_pil).unsqueeze(0)
 
 
-# ==========================================================
-#  GRAD-CAM (opcional, pero lo dejo listo)
-# ==========================================================
-def last_conv_layer(model):
+def last_conv_layer(model: nn.Module):
     for _, m in reversed(list(model.named_modules())):
         if isinstance(m, nn.Conv2d):
             return m
     return None
 
 
-def gradcam(model, x):
+def gradcam(model: nn.Module, x: torch.Tensor):
+    """
+    simple grad-cam sobre la ultima conv detectada.
+    retorna mapa CAM normalizado (H,W) y pred_idx.
+    """
     layer = last_conv_layer(model)
     if layer is None:
-        raise RuntimeError("No se encontro una capa conv para grad-cam.")
+        raise RuntimeError(
+            "no se encontro una capa conv en el modelo (grad-cam no disponible)"
+        )
 
     activations = []
     gradients = []
 
-    def fwd(_, __, out):
+    def fwd_hook(_, __, out):
         activations.append(out.detach())
 
-    def bwd(_, gin, gout):
+    def bwd_hook(_, gin, gout):
         gradients.append(gout[0].detach())
 
-    h1 = layer.register_forward_hook(fwd)
-    h2 = layer.register_full_backward_hook(bwd)
+    h1 = layer.register_forward_hook(fwd_hook)
+    h2 = layer.register_full_backward_hook(bwd_hook)
 
     model.zero_grad()
     out = model(x)
     pred_idx = int(out.argmax(1).item())
-    out[0, pred_idx].backward()
+    loss = out[0, pred_idx]
+    loss.backward()
 
-    a = activations[-1][0]      # (C,H,W)
-    g = gradients[-1][0]        # (C,H,W)
-    w = g.mean(dim=(1, 2))      # (C,)
-
-    cam = (w[:, None, None] * a).sum(0).clamp(min=0)
+    a = activations[-1][0]  # (C,H,W)
+    g = gradients[-1][0]  # (C,H,W)
+    w = g.mean(dim=(1, 2))  # (C,)
+    cam = (w[:, None, None] * a).sum(0).clamp(min=0)  # (H,W)
     cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
 
     h1.remove()
@@ -285,98 +203,123 @@ def gradcam(model, x):
     return cam.cpu().numpy(), pred_idx
 
 
-# ==========================================================
-#  DISCOVER MODELS
-# ==========================================================
+# ----------------------------
+# auto-discover local models
+# ----------------------------
 models_dir = Path("models")
 models_dir.mkdir(exist_ok=True)
 available_models = sorted([p.name for p in models_dir.glob("*.pt")])
 
 
-# ==========================================================
-#  SIDEBAR
-# ==========================================================
-st.sidebar.header("Config")
-
+# ----------------------------
+# sidebar - config
+# ----------------------------
+st.sidebar.header("config")
 if not available_models:
-    st.sidebar.warning("No hay modelos en carpeta 'models/'")
+    st.sidebar.warning("no hay archivos .pt en carpeta 'models/'")
 
-model_file = st.sidebar.selectbox("Modelo (.pt)", available_models) if available_models else None
-img_size = st.sidebar.slider("Tamaño de entrada (px)", 128, 1024, 384, 32)
-top_k = st.sidebar.slider("top-k", 1, 5, 5)
-show_cam = st.sidebar.checkbox("Mostrar grad-cam", False)
+model_file = (
+    st.sidebar.selectbox("modelo local (.pt)", available_models)
+    if available_models
+    else None
+)
+img_size = st.sidebar.number_input(
+    "tamano de entrada (px)", min_value=128, max_value=1024, value=384, step=32
+)
+use_imagenet = st.sidebar.checkbox("normalizacion imagenet", value=True)
+top_k = st.sidebar.slider("top-k", min_value=1, max_value=10, value=5)
+raw_classes = st.sidebar.text_input(
+    "orden de clases manual (coma-separado, opcional)", ""
+)
+force_classes = (
+    [c.strip() for c in raw_classes.split(",")] if raw_classes.strip() else None
+)
+show_cam = st.sidebar.checkbox("mostrar grad-cam", value=True)
 
 
-# ==========================================================
-#  UI PRINCIPAL
-# ==========================================================
-col1, col2 = st.columns(2)
+# ----------------------------
+# body - ui
+# ----------------------------
+col1, col2 = st.columns([1, 1])
 
 with col1:
-    st.subheader("Imagen")
-    uploaded = st.file_uploader("Sube una imagen pulmonar", type=["jpg", "png", "jpeg"])
+    st.subheader("imagen")
+    uploaded = st.file_uploader("sube jpg/png", type=["jpg", "jpeg", "png"])
     img_pil = None
-    if uploaded:
+    if uploaded is not None:
         img_pil = Image.open(io.BytesIO(uploaded.read())).convert("RGB")
-        st.image(img_pil, caption="Imagen cargada", use_column_width=True)
+        st.image(img_pil, caption="imagen cargada", width="stretch")
 
 with col2:
-    st.subheader("Modelo")
+    st.subheader("modelo")
     model = None
     classes = None
+    temp = None
     model_name = None
-
     if model_file:
         try:
-            model, classes, model_name = load_ckpt(models_dir / model_file)
-            st.success(f"Modelo detectado: {model_name}")
-            st.write("Clases:", classes)
+            model, classes, temp, model_name = load_ckpt(
+                models_dir / model_file, force_classes=force_classes
+            )
+            st.success(f"modelo: {model_name} | clases: {classes}")
+            warn = getattr(model, "__load_warnings__", None)
+            if warn:
+                st.warning(
+                    f"carga no estricta: missing={len(warn.missing_keys)}, unexpected={len(warn.unexpected_keys)}"
+                )
+                dbg = getattr(model, "__load_debug__", {})
+                if dbg:
+                    st.caption(f"missing_sample: {dbg.get('missing_sample')}")
+                    st.caption(f"unexpected_sample: {dbg.get('unexpected_sample')}")
+            if hasattr(model, "fc"):
+                st.caption(f"fc.out_features = {model.fc.out_features}")
+            else:
+                st.caption("modelo sin capa fc (CNN personalizada)")
+
         except Exception as e:
-            st.error(f"Error al cargar modelo: {e}")
+            st.error(f"error al cargar: {e}")
 
 st.markdown("---")
 
-# ==========================================================
-#  PREDICCION
-# ==========================================================
-if img_pil is not None and model is not None:
-    x = preprocess(img_pil, img_size)
-
+if (img_pil is not None) and (model is not None):
+    # prediccion
+    x = preprocess(img_pil, size=img_size, use_imagenet_norm=use_imagenet)
     with torch.no_grad():
         logits = model(x)
+        if temp:
+            logits = logits / temp
         probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
 
     idx = int(np.argmax(probs))
-    pred = classes[idx]
-
-    st.subheader("Resultado")
-    st.success(f"Prediccion: {pred} (indice {idx})")
-
+    pred_label = classes[idx] if classes else f"clase_{idx}"
+    st.subheader("resultado")
+    st.success(f"clase predicha: {pred_label}")
+    # top-k
     order = np.argsort(probs)[::-1][:top_k]
-    topk = {classes[i]: float(probs[i]) for i in order}
-    st.write(topk)
-    st.bar_chart(topk)
+    topk_dict = {
+        (classes[i] if classes else f"clase_{i}"): float(probs[i]) for i in order
+    }
+    st.write(topk_dict)
+    st.bar_chart(topk_dict)
 
+    # grad-cam
     if show_cam:
         try:
-            cam, _ = gradcam(model, x)
+            cam, pred_idx = gradcam(model, x)
             cam_uint8 = (cam * 255).astype("uint8")
             cam_img = (
                 Image.fromarray(cam_uint8)
-                .resize(img_pil.size)
+                .resize(img_pil.size, resample=Image.BILINEAR)
                 .convert("L")
             )
             img_arr = np.array(img_pil).astype("float32")
             heat = np.stack(
                 [np.array(cam_img), np.zeros_like(cam_uint8), np.zeros_like(cam_uint8)],
                 axis=-1,
-            )
-            overlay = (0.5 * img_arr + 0.5 * heat).clip(0, 255).astype("uint8")
-            st.image(overlay, caption="grad-cam", use_column_width=True)
+            ).astype("float32")
+            overlap = (0.5 * img_arr + 0.5 * heat).clip(0, 255).astype("uint8")
+            st.image(overlap, caption="grad-cam (overlay R)", use_column_width=True)
         except Exception as e:
-            st.error(f"Error en grad-cam: {e}")
+            st.info(f"grad-cam no disponible: {e}")
 else:
-    if model is None:
-        st.info("Selecciona un modelo .pt en la barra lateral.")
-    if img_pil is None:
-        st.info("Sube una imagen para predecir.")
+    st.info("sube una imagen y selecciona un modelo para predecir")
