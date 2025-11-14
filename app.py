@@ -74,7 +74,7 @@ st.title("🫁 Pulmo-ML Viewer - clasificacion pulmonar")
 
 
 # ----------------------------------------------------------
-# LOAD CHECKPOINT (ROBUSTO)
+# LOAD CHECKPOINT (FORZANDO 5 CLASES)
 # ----------------------------------------------------------
 @st.cache_resource
 def load_ckpt(ckpt_path: Path):
@@ -83,7 +83,7 @@ def load_ckpt(ckpt_path: Path):
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
     # -----------------------------
-    # fallback de clases
+    # CLASES: siempre 5 de pulmon
     # -----------------------------
     DEFAULT_CLASSES = [
         "bacterial_pneumonia",
@@ -102,7 +102,18 @@ def load_ckpt(ckpt_path: Path):
             with open(cl_path, "r", encoding="utf-8") as f:
                 classes = [line.strip() for line in f.readlines() if line.strip()]
         else:
-            classes = None  # por ahora
+            classes = DEFAULT_CLASSES
+    else:
+        # nos quedamos solo con las 5 primeras que tengan sentido
+        classes = list(classes)
+        if len(classes) < 5:
+            classes = DEFAULT_CLASSES
+        else:
+            classes = classes[:5]
+
+    # FORZAMOS: SIEMPRE 5 CLASES
+    num_classes = 5
+    classes = classes[:5]
 
     # -------------------------------------------
     # Obtener state_dict real del checkpoint
@@ -114,7 +125,7 @@ def load_ckpt(ckpt_path: Path):
         or ckpt
     )
     if not isinstance(sd, dict):
-        raise ValueError("No se encontró un dict de pesos en el checkpoint.")
+        raise ValueError("No se encontro un dict de pesos en el checkpoint.")
 
     # -------------------------------------------
     # Limpieza de prefijos
@@ -132,40 +143,17 @@ def load_ckpt(ckpt_path: Path):
     sd = strip_prefixes(sd)
 
     # -------------------------------------------
-    # Detectar num_classes a partir de los pesos
-    # -------------------------------------------
-    def num_classes_from_sd(sd_dict):
-        for key in sd_dict:
-            if key.endswith("c3.weight") or key.endswith("fc.2.weight") or key == "fc.weight":
-                return sd_dict[key].shape[0]
-        # fallback si no encontramos cabeza
-        return len(classes) if classes is not None else len(DEFAULT_CLASSES)
-
-    num_classes = num_classes_from_sd(sd)
-
-    # Ajustar lista de clases final, sin romper nada
-    if classes is None:
-        # usamos default recortado o extendido
-        if num_classes <= len(DEFAULT_CLASSES):
-            classes = DEFAULT_CLASSES[:num_classes]
-        else:
-            classes = DEFAULT_CLASSES + [f"class_{i}" for i in range(len(DEFAULT_CLASSES), num_classes)]
-    else:
-        # si hay mismatch entre len(classes) y num_classes, recortamos o rellenamos
-        if len(classes) > num_classes:
-            classes = classes[:num_classes]
-        elif len(classes) < num_classes:
-            classes = classes + [f"class_{i}" for i in range(len(classes), num_classes)]
-
-    # -------------------------------------------
-    # AUTO-DETECTAR ARQUITECTURA
+    # AUTO-DETECTAR ARQUITECTURA (resnet / cnn)
     # -------------------------------------------
     has_resnet_layers = any(
         k.startswith("layer1.") or k.startswith("conv1.") for k in sd.keys()
     )
     has_sequential_keys = any(k.startswith("conv.") or k.startswith("fc.") for k in sd.keys())
-    has_custom_keys = any(k.startswith(("f0.", "f3.", "f6.", "f9.", "c3.")) or k.startswith(("f.", "c.")) for k in sd.keys())
-
+    has_custom_keys = any(
+        k.startswith(("f0.", "f3.", "f6.", "f9.", "c3."))
+        or k.startswith(("f.", "c."))
+        for k in sd.keys()
+    )
     arch_meta = (ckpt.get("arch") or (ckpt.get("args", {}) or {}).get("model") or "").lower()
 
     # --- RESNET ---
@@ -176,7 +164,6 @@ def load_ckpt(ckpt_path: Path):
         else:
             model = tvm.resnet18(weights=None)
             model_name = "resnet18"
-        # ajustar cabeza
         model.fc = nn.Linear(model.fc.in_features, num_classes)
 
     # --- CNNSequential (conv.* y fc.*) ---
@@ -186,7 +173,7 @@ def load_ckpt(ckpt_path: Path):
 
     # --- CNNSimple (f0,f3,f6,f9,c3) ---
     elif has_custom_keys or arch_meta.startswith("cnn"):
-        # remap f.X → fX si fuera necesario
+        # remap f.X → fX si viene como f.0.weight, etc.
         fixed = {}
         pat = re.compile(r"^(f|c)\.(\d+)\.(.+)$")
         for k, v in sd.items():
@@ -207,17 +194,13 @@ def load_ckpt(ckpt_path: Path):
         model_name = "resnet18_fallback"
 
     # -------------------------------------------
-    # Cargar pesos (permitiendo missing/unexpected)
+    # Cargar pesos (permitiendo mismatch en la cabeza)
     # -------------------------------------------
     try:
         model.load_state_dict(sd, strict=True)
     except Exception:
-        try:
-            warn = model.load_state_dict(sd, strict=False)
-            model.__load_warnings__ = warn
-        except Exception:
-            # ultimo recurso: modelo con pesos random, pero sin romper la app
-            model.__load_warnings__ = "no se pudieron cargar todos los pesos (modelo inicializado aleatoriamente)"
+        warn = model.load_state_dict(sd, strict=False)
+        model.__load_warnings__ = warn
 
     model.eval()
     return model, classes, model_name
