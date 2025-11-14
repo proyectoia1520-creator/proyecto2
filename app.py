@@ -26,42 +26,56 @@ def load_ckpt(ckpt_path: Path):
     import re
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
-    # ----------------------------
-    # clases: SIEMPRE desde el checkpoint
-    # (o desde un classes.txt junto al modelo)
-    # ----------------------------
+    # ----------------------
+    # cargar clases del checkpoint o usar fallback oficial
+    # ----------------------
+    DEFAULT_CLASSES = [
+        "bacterial_pneumonia",
+        "covid",
+        "normal_lung",
+        "tuberculosis",
+        "viral_pneumonia",
+    ]
+
     classes = ckpt.get("classes")
 
     if classes is None:
+        # intentar leer un classes.txt al lado del modelo
         classes_txt = ckpt_path.parent / "classes.txt"
         if classes_txt.exists():
             with open(classes_txt, "r", encoding="utf-8") as f:
                 classes = [line.strip() for line in f.readlines() if line.strip()]
-
-    if not classes:
-        raise ValueError(
-            "No se encontro la lista de clases: el checkpoint no trae 'classes' "
-            "y tampoco existe un 'classes.txt' junto al modelo."
-        )
+        else:
+            # si no hay nada, usar el orden por defecto
+            classes = DEFAULT_CLASSES
 
     num_classes = len(classes)
 
     # arquitectura
-    model_name = (ckpt.get("arch") or (ckpt.get("args",{}) or {}).get("model") or "cnn_basica").lower()
+    model_name = (
+        ckpt.get("arch")
+        or (ckpt.get("args", {}) or {}).get("model")
+        or "cnn_basica"
+    ).lower()
 
     # state_dict crudo
-    sd = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt.get("model") or ckpt
+    sd = (
+        ckpt.get("model_state_dict")
+        or ckpt.get("state_dict")
+        or ckpt.get("model")
+        or ckpt
+    )
     if not isinstance(sd, dict):
         raise ValueError("No se encontro un dict de pesos en el checkpoint.")
 
     # limpiar prefijos
-    def strip_prefixes(d, prefixes=("module.","model.","backbone.")):
+    def strip_prefixes(d, prefixes=("module.", "model.", "backbone.")):
         out = {}
         for k, v in d.items():
             nk = k
             for p in prefixes:
                 if nk.startswith(p):
-                    nk = nk[len(p):]
+                    nk = nk[len(p) :]
             out[nk] = v
         return out
 
@@ -69,27 +83,28 @@ def load_ckpt(ckpt_path: Path):
 
     # decidir arquitectura y construir modelo
     from models.cnn_basica_def import CNNSimple
-    # si aparecen llaves con 'f.' o 'c.' asumimos tu CNN
-    is_custom = (model_name == "cnn_basica") or any(k.startswith(("f.","c.")) for k in sd.keys())
+
+    # si aparecen llaves con 'f.' o 'c.' asumimos tu CNN personalizada
+    is_custom = (model_name == "cnn_basica") or any(
+        k.startswith(("f.", "c.")) for k in sd.keys()
+    )
     if is_custom:
         model = CNNSimple(num_classes=num_classes)
         # remap f.<num>.* -> f<num>.*  y c.<num>.* -> c<num>.*
         fixed = {}
-        pat = re.compile(r'^(f|c)\.(\d+)\.(.+)$')  # ej: f.3.weight -> f3.weight
+        pat = re.compile(r"^(f|c)\.(\d+)\.(.+)$")  # ej: f.3.weight -> f3.weight
         for k, v in sd.items():
             m = pat.match(k)
             fixed[(f"{m.group(1)}{m.group(2)}.{m.group(3)}" if m else k)] = v
         sd = fixed
         model_name = "cnn_basica"
     else:
-        import torchvision.models as tvm
-        import torch.nn as nn
         if model_name == "resnet50":
             model = tvm.resnet50(weights=None)
         else:
             model = tvm.resnet18(weights=None)
         model.fc = nn.Linear(model.fc.in_features, num_classes)
-    
+
     # --- NORMALIZAR LLAVES DE LA CABEZA FC PARA RESNET ---
     def remap_resnet_fc_keys(sd: dict):
         # Si el ckpt trae una cabeza secuencial (fc.1.*), mapeamos a fc.*
@@ -97,12 +112,12 @@ def load_ckpt(ckpt_path: Path):
             fixed = {}
             for k, v in sd.items():
                 if k.startswith("fc.1."):
-                    fixed["fc." + k[len("fc.1."):]] = v  # fc.1.weight -> fc.weight
-                elif not k.startswith("fc.0."):         # fc.0.* suele ser Dropout/ReLU sin params
+                    fixed["fc." + k[len("fc.1.") :]] = v  # fc.1.weight -> fc.weight
+                elif not k.startswith("fc.0."):  # fc.0.* suele ser Dropout/ReLU sin params
                     fixed[k] = v
             return fixed
         return sd
-    
+
     sd = remap_resnet_fc_keys(sd)
 
     # cargar pesos (estricto; si falla, no estricto + warning)
@@ -113,7 +128,10 @@ def load_ckpt(ckpt_path: Path):
         model.__load_warnings__ = warn
         miss = list(warn.missing_keys)[:10]
         unexp = list(warn.unexpected_keys)[:10]
-        model.__load_debug__ = {"missing_sample": miss, "unexpected_sample": unexp}
+        model.__load_debug__ = {
+            "missing_sample": miss,
+            "unexpected_sample": unexp,
+        }
 
     model.eval()
     temp = ckpt.get("temperature", None)
@@ -125,11 +143,15 @@ def preprocess(img_pil, size=384, use_imagenet_norm=True):
         T.Grayscale(num_output_channels=3),
         T.Resize(size),
         T.CenterCrop(size),
-        T.ToTensor()
+        T.ToTensor(),
     ]
     if use_imagenet_norm:
-        ops.append(T.Normalize([0.485, 0.456, 0.406],
-                               [0.229, 0.224, 0.225]))
+        ops.append(
+            T.Normalize(
+                [0.485, 0.456, 0.406],
+                [0.229, 0.224, 0.225],
+            )
+        )
     return T.Compose(ops)(img_pil).unsqueeze(0)
 
 
@@ -147,7 +169,9 @@ def gradcam(model: nn.Module, x: torch.Tensor):
     """
     layer = last_conv_layer(model)
     if layer is None:
-        raise RuntimeError("no se encontro una capa conv en el modelo (grad-cam no disponible)")
+        raise RuntimeError(
+            "no se encontro una capa conv en el modelo (grad-cam no disponible)"
+        )
 
     activations = []
     gradients = []
@@ -167,9 +191,9 @@ def gradcam(model: nn.Module, x: torch.Tensor):
     loss = out[0, pred_idx]
     loss.backward()
 
-    a = activations[-1][0]           # (C,H,W)
-    g = gradients[-1][0]             # (C,H,W)
-    w = g.mean(dim=(1, 2))           # (C,)
+    a = activations[-1][0]  # (C,H,W)
+    g = gradients[-1][0]  # (C,H,W)
+    w = g.mean(dim=(1, 2))  # (C,)
     cam = (w[:, None, None] * a).sum(0).clamp(min=0)  # (H,W)
     cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
 
@@ -192,8 +216,14 @@ available_models = sorted([p.name for p in models_dir.glob("*.pt")])
 st.sidebar.header("config")
 if not available_models:
     st.sidebar.warning("no hay archivos .pt en carpeta 'models/'")
-model_file = st.sidebar.selectbox("modelo local (.pt)", available_models) if available_models else None
-img_size = st.sidebar.number_input("tamano de entrada (px)", min_value=128, max_value=1024, value=384, step=32)
+model_file = (
+    st.sidebar.selectbox("modelo local (.pt)", available_models)
+    if available_models
+    else None
+)
+img_size = st.sidebar.number_input(
+    "tamano de entrada (px)", min_value=128, max_value=1024, value=384, step=32
+)
 use_imagenet = st.sidebar.checkbox("normalizacion imagenet", value=True)
 top_k = st.sidebar.slider("top-k", min_value=1, max_value=10, value=5)
 show_cam = st.sidebar.checkbox("mostrar grad-cam", value=True)
@@ -210,7 +240,7 @@ with col1:
     img_pil = None
     if uploaded is not None:
         img_pil = Image.open(io.BytesIO(uploaded.read())).convert("RGB")
-        st.image(img_pil, caption="imagen cargada", width='stretch')
+        st.image(img_pil, caption="imagen cargada", use_column_width=True)
 
 with col2:
     st.subheader("modelo")
@@ -224,7 +254,9 @@ with col2:
             st.success(f"modelo: {model_name} | clases: {classes}")
             warn = getattr(model, "__load_warnings__", None)
             if warn:
-                st.warning(f"carga no estricta: missing={len(warn.missing_keys)}, unexpected={len(warn.unexpected_keys)}")
+                st.warning(
+                    f"carga no estricta: missing={len(warn.missing_keys)}, unexpected={len(warn.unexpected_keys)}"
+                )
                 dbg = getattr(model, "__load_debug__", {})
                 if dbg:
                     st.caption(f"missing_sample: {dbg.get('missing_sample')}")
@@ -255,7 +287,9 @@ if (img_pil is not None) and (model is not None):
 
     # top-k
     order = np.argsort(probs)[::-1][:top_k]
-    topk_dict = {(classes[i] if classes else f'clase_{i}'): float(probs[i]) for i in order}
+    topk_dict = {
+        (classes[i] if classes else f"clase_{i}"): float(probs[i]) for i in order
+    }
     st.write(topk_dict)
     st.bar_chart(topk_dict)
 
@@ -264,11 +298,15 @@ if (img_pil is not None) and (model is not None):
         try:
             cam, pred_idx = gradcam(model, x)
             cam_uint8 = (cam * 255).astype("uint8")
-            cam_img = Image.fromarray(cam_uint8).resize(img_pil.size, resample=Image.BILINEAR).convert("L")
+            cam_img = (
+                Image.fromarray(cam_uint8)
+                .resize(img_pil.size, resample=Image.BILINEAR)
+                .convert("L")
+            )
             img_arr = np.array(img_pil).astype("float32")
             heat = np.stack(
                 [np.array(cam_img), np.zeros_like(cam_uint8), np.zeros_like(cam_uint8)],
-                axis=-1
+                axis=-1,
             ).astype("float32")
             heat = (heat / 255.0) * 255.0
             overlap = (0.5 * img_arr + 0.5 * heat).clip(0, 255).astype("uint8")
