@@ -38,12 +38,12 @@ class CNNSimple(nn.Module):
 
 class CNNSequential(nn.Module):
     """
-    Usado para checkpoints con capas conv.* y sin definir claramente la cabeza.
-    Construimos la parte conv con pesos del checkpoint y la fc nueva con 5 clases.
+    Para checkpoints con conv.* y fc.* (tus CNN secuenciales antiguas).
+    Reconstruimos conv.* desde el checkpoint y usamos una fc nueva de 5 clases.
     """
     def __init__(self, out_channels, num_classes=5):
         super().__init__()
-        self.conv = nn.Identity()  # se rellena luego con un nn.Sequential
+        self.conv = nn.Identity()  # se rellena luego
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(out_channels, num_classes)
 
@@ -63,7 +63,7 @@ st.title("🫁 Pulmo-ML Viewer - Clasificacion pulmonar")
 
 
 # ==========================================================
-#  CARGA DE CHECKPOINT (RESNET18/50 + CNNs) 
+#  CARGA DE CHECKPOINT
 # ==========================================================
 @st.cache_resource
 def load_ckpt(ckpt_path: Path):
@@ -74,7 +74,7 @@ def load_ckpt(ckpt_path: Path):
     # -----------------------------
     # CLASES: siempre 5 de pulmon
     # -----------------------------
-    DEFAULT_CLASSES = [
+    CLASSES = [
         "bacterial_pneumonia",
         "covid",
         "normal_lung",
@@ -82,40 +82,20 @@ def load_ckpt(ckpt_path: Path):
         "viral_pneumonia",
     ]
 
-    classes = ckpt.get("classes")
-
-    if classes is None:
-        # intentar classes.txt
-        cl_path = ckpt_path.parent / "classes.txt"
-        if cl_path.exists():
-            with open(cl_path, "r", encoding="utf-8") as f:
-                classes = [line.strip() for line in f.readlines() if line.strip()]
-        else:
-            classes = DEFAULT_CLASSES
-    else:
-        classes = list(classes)
-        if len(classes) < 5:
-            classes = DEFAULT_CLASSES
-        else:
-            classes = classes[:5]
-
-    num_classes = 5
-    classes = classes[:5]
-
     # -------------------------------------------
     # Obtener state_dict real del checkpoint
     # -------------------------------------------
-    sd = (
+    sd_raw = (
         ckpt.get("model_state_dict")
         or ckpt.get("state_dict")
         or ckpt.get("model")
         or ckpt
     )
-    if not isinstance(sd, dict):
+    if not isinstance(sd_raw, dict):
         raise ValueError("No se encontro un dict de pesos en el checkpoint.")
 
     # -------------------------------------------
-    # Limpieza de prefijos
+    # Limpiar prefijos
     # -------------------------------------------
     def strip_prefixes(d, prefixes=("module.", "model.", "backbone.")):
         out = {}
@@ -127,67 +107,76 @@ def load_ckpt(ckpt_path: Path):
             out[nk] = v
         return out
 
-    sd = strip_prefixes(sd)
+    sd = strip_prefixes(sd_raw)
+
+    # -------------------------------------------
+    # Quitar cualquier cabeza fc/classifier del state_dict
+    # (asi evitamos size mismatch en la ultima capa)
+    # -------------------------------------------
+    def remove_head_keys(d):
+        return {
+            k: v
+            for k, v in d.items()
+            if not (k.startswith("fc.") or k.startswith("classifier."))
+        }
+
+    sd_nohead = remove_head_keys(sd)
 
     # -------------------------------------------
     # AUTO-DETECTAR ARQUITECTURA
     # -------------------------------------------
-    has_resnet_layers = any(
-        k.startswith("layer1.") or k.startswith("conv1.") for k in sd.keys()
-    )
-    has_sequential_keys = any(k.startswith("conv.") or k.startswith("fc.") for k in sd.keys())
+    has_resnet_layers = any(k.startswith("layer1.") for k in sd_nohead.keys())
     has_custom_keys = any(
         k.startswith(("f0.", "f3.", "f6.", "f9.", "c3."))
         or k.startswith(("f.", "c."))
-        for k in sd.keys()
+        for k in sd_nohead.keys()
     )
+    has_seq_keys = any(
+        k.startswith("conv.") or k.startswith("fc.") for k in sd_nohead.keys()
+    )
+
     arch_meta = (ckpt.get("arch") or (ckpt.get("args", {}) or {}).get("model") or "").lower()
 
     # =====================================================
-    #  CASO 1: RESNET (18 o 50 segun fc.weight de checkpoint)
+    #  CASO 1: RESNET (asumimos SIEMPRE ResNet50 torchvision)
     # =====================================================
-    if has_resnet_layers or arch_meta.startswith("resnet"):
-        fc_in = None
-        if "fc.weight" in sd:
-            fc_in = sd["fc.weight"].shape[1]  # columnas = in_features de la fc original
+    if has_resnet_layers or "resnet" in arch_meta:
+        # usamos resnet50 siempre, porque tus pesos se ven de resnet50
+        backbone = tvm.resnet50(weights=None)
+        # nueva cabeza de 5 clases
+        backbone.fc = nn.Linear(backbone.fc.in_features, 5)
 
-        if fc_in == 2048:
-            backbone = tvm.resnet50(weights=None)
-            model_name = "resnet50"
-        else:
-            backbone = tvm.resnet18(weights=None)
-            model_name = "resnet18"
-
-        backbone.fc = nn.Linear(backbone.fc.in_features, num_classes)
-        backbone.load_state_dict(sd, strict=False)
+        # cargamos solo las capas que calzan (sin fc.* en el dict → no hay size mismatch en la cabeza)
+        missing, unexpected = backbone.load_state_dict(sd_nohead, strict=False)
         backbone.eval()
-        return backbone, classes, model_name
+        return backbone, CLASSES, "resnet50"
 
     # =====================================================
-    #  CASO 2: CNNSimple (f0,f3,f6,f9,c3)
+    #  CASO 2: CNNSimple (cnn_basica)
     # =====================================================
     if has_custom_keys or arch_meta.startswith("cnn"):
+        # remap f.X → fX si fuera necesario (f.0.weight → f0.weight)
         fixed = {}
         pat = re.compile(r"^(f|c)\.(\d+)\.(.+)$")
-        for k, v in sd.items():
+        for k, v in sd_nohead.items():
             m = pat.match(k)
             if m:
                 nk = f"{m.group(1)}{m.group(2)}.{m.group(3)}"
             else:
                 nk = k
             fixed[nk] = v
-        sd_simple = fixed
 
-        model = CNNSimple(num_classes=num_classes)
-        model.load_state_dict(sd_simple, strict=False)
+        model = CNNSimple(num_classes=5)
+        model.load_state_dict(fixed, strict=False)
         model.eval()
-        return model, classes, "cnn_basica"
+        return model, CLASSES, "cnn_basica"
 
     # =====================================================
-    #  CASO 3: CNNSequential (conv.* y fc.*)
+    #  CASO 3: CNNSequential (conv.* / fc.*)
     # =====================================================
-    if has_sequential_keys:
-        conv_items = [(k, v) for k, v in sd.items() if k.startswith("conv.")]
+    if has_seq_keys:
+        # reconstruimos solo conv.*
+        conv_items = [(k, v) for k, v in sd_nohead.items() if k.startswith("conv.")]
         conv_layers = {}
 
         for full_key, tensor in conv_items:
@@ -221,22 +210,22 @@ def load_ckpt(ckpt_path: Path):
             else:
                 conv_seq.append(nn.ReLU())
 
-        backbone = nn.Sequential(*conv_seq)
         if out_channels is None:
-            out_channels = 128  # fallback
+            out_channels = 128  # fallback por si acaso
 
-        model = CNNSequential(out_channels=out_channels, num_classes=num_classes)
+        backbone = nn.Sequential(*conv_seq)
+        model = CNNSequential(out_channels=out_channels, num_classes=5)
         model.conv = backbone
         model.eval()
-        return model, classes, "cnn_sequential"
+        return model, CLASSES, "cnn_sequential"
 
     # =====================================================
-    #  Fallback: resnet18 sin pesos
+    #  Fallback: resnet18 sin pesos (por si nada coincide)
     # =====================================================
     fallback = tvm.resnet18(weights=None)
-    fallback.fc = nn.Linear(fallback.fc.in_features, num_classes)
+    fallback.fc = nn.Linear(fallback.fc.in_features, 5)
     fallback.eval()
-    return fallback, classes, "resnet18_fallback"
+    return fallback, CLASSES, "resnet18_fallback"
 
 
 # ==========================================================
@@ -253,7 +242,7 @@ def preprocess(img_pil, size=384):
 
 
 # ==========================================================
-#  (Opcional) GRAD-CAM - si luego quieres agregar, se puede
+#  GRAD-CAM (opcional, pero lo dejo listo)
 # ==========================================================
 def last_conv_layer(model):
     for _, m in reversed(list(model.named_modules())):
