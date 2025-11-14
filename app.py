@@ -22,14 +22,28 @@ st.title("🫁 Pulmo-ML Viewer - clasificacion pulmonar")
 # utils
 # ----------------------------
 @st.cache_resource
-def load_ckpt(ckpt_path: Path, force_classes=None):
+def load_ckpt(ckpt_path: Path):
     import re
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
-    # clases
-    classes = force_classes if force_classes else ckpt.get("classes")
+    # ----------------------------
+    # clases: SIEMPRE desde el checkpoint
+    # (o desde un classes.txt junto al modelo)
+    # ----------------------------
+    classes = ckpt.get("classes")
+
+    if classes is None:
+        classes_txt = ckpt_path.parent / "classes.txt"
+        if classes_txt.exists():
+            with open(classes_txt, "r", encoding="utf-8") as f:
+                classes = [line.strip() for line in f.readlines() if line.strip()]
+
     if not classes:
-        raise ValueError("El checkpoint no trae 'classes' y no se ingreso un orden manual.")
+        raise ValueError(
+            "No se encontro la lista de clases: el checkpoint no trae 'classes' "
+            "y tampoco existe un 'classes.txt' junto al modelo."
+        )
+
     num_classes = len(classes)
 
     # arquitectura
@@ -42,14 +56,15 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
 
     # limpiar prefijos
     def strip_prefixes(d, prefixes=("module.","model.","backbone.")):
-        out={}
-        for k,v in d.items():
-            nk=k
+        out = {}
+        for k, v in d.items():
+            nk = k
             for p in prefixes:
                 if nk.startswith(p):
                     nk = nk[len(p):]
-            out[nk]=v
+            out[nk] = v
         return out
+
     sd = strip_prefixes(sd)
 
     # decidir arquitectura y construir modelo
@@ -59,9 +74,9 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
     if is_custom:
         model = CNNSimple(num_classes=num_classes)
         # remap f.<num>.* -> f<num>.*  y c.<num>.* -> c<num>.*
-        fixed={}
+        fixed = {}
         pat = re.compile(r'^(f|c)\.(\d+)\.(.+)$')  # ej: f.3.weight -> f3.weight
-        for k,v in sd.items():
+        for k, v in sd.items():
             m = pat.match(k)
             fixed[(f"{m.group(1)}{m.group(2)}.{m.group(3)}" if m else k)] = v
         sd = fixed
@@ -89,6 +104,7 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
         return sd
     
     sd = remap_resnet_fc_keys(sd)
+
     # cargar pesos (estricto; si falla, no estricto + warning)
     try:
         model.load_state_dict(sd, strict=True)
@@ -105,10 +121,12 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
 
 
 def preprocess(img_pil, size=384, use_imagenet_norm=True):
-    ops = [T.Grayscale(num_output_channels=3),
-           T.Resize(size),
-           T.CenterCrop(size),
-           T.ToTensor()]
+    ops = [
+        T.Grayscale(num_output_channels=3),
+        T.Resize(size),
+        T.CenterCrop(size),
+        T.ToTensor()
+    ]
     if use_imagenet_norm:
         ops.append(T.Normalize([0.485, 0.456, 0.406],
                                [0.229, 0.224, 0.225]))
@@ -178,8 +196,6 @@ model_file = st.sidebar.selectbox("modelo local (.pt)", available_models) if ava
 img_size = st.sidebar.number_input("tamano de entrada (px)", min_value=128, max_value=1024, value=384, step=32)
 use_imagenet = st.sidebar.checkbox("normalizacion imagenet", value=True)
 top_k = st.sidebar.slider("top-k", min_value=1, max_value=10, value=5)
-raw_classes = st.sidebar.text_input("orden de clases manual (coma-separado, opcional)", "")
-force_classes = [c.strip() for c in raw_classes.split(",")] if raw_classes.strip() else None
 show_cam = st.sidebar.checkbox("mostrar grad-cam", value=True)
 
 
@@ -204,7 +220,7 @@ with col2:
     model_name = None
     if model_file:
         try:
-            model, classes, temp, model_name = load_ckpt(models_dir / model_file, force_classes=force_classes)
+            model, classes, temp, model_name = load_ckpt(models_dir / model_file)
             st.success(f"modelo: {model_name} | clases: {classes}")
             warn = getattr(model, "__load_warnings__", None)
             if warn:
@@ -235,22 +251,25 @@ if (img_pil is not None) and (model is not None):
     idx = int(np.argmax(probs))
     pred_label = classes[idx] if classes else f"clase_{idx}"
     st.subheader("resultado")
-    st.success(f"clase predicha: {pred_label}")
+    st.success(f"clase predicha: {pred_label} (indice {idx})")
+
     # top-k
     order = np.argsort(probs)[::-1][:top_k]
-    st.write({(classes[i] if classes else f'clase_{i}'): float(probs[i]) for i in order})
-    st.bar_chart({(classes[i] if classes else f'clase_{i}'): float(probs[i]) for i in order})
+    topk_dict = {(classes[i] if classes else f'clase_{i}'): float(probs[i]) for i in order}
+    st.write(topk_dict)
+    st.bar_chart(topk_dict)
 
     # grad-cam
     if show_cam:
         try:
             cam, pred_idx = gradcam(model, x)
-            # overlay simple con matplotlib-free: usar numpy + PIL
             cam_uint8 = (cam * 255).astype("uint8")
             cam_img = Image.fromarray(cam_uint8).resize(img_pil.size, resample=Image.BILINEAR).convert("L")
-            # heatmap basico: mezclar cam en canal R
             img_arr = np.array(img_pil).astype("float32")
-            heat = np.stack([np.array(cam_img), np.zeros_like(cam_uint8), np.zeros_like(cam_uint8)], axis=-1).astype("float32")
+            heat = np.stack(
+                [np.array(cam_img), np.zeros_like(cam_uint8), np.zeros_like(cam_uint8)],
+                axis=-1
+            ).astype("float32")
             heat = (heat / 255.0) * 255.0
             overlap = (0.5 * img_arr + 0.5 * heat).clip(0, 255).astype("uint8")
             st.image(overlap, caption="grad-cam (overlay R)", use_column_width=True)
@@ -258,4 +277,3 @@ if (img_pil is not None) and (model is not None):
             st.info(f"grad-cam no disponible: {e}")
 else:
     st.info("sube una imagen y selecciona un modelo para predecir")
-
