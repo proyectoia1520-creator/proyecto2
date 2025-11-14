@@ -11,19 +11,19 @@ import torchvision.transforms as T
 import streamlit as st
 
 
-# ----------------------------
-# app config
-# ----------------------------
+# ==========================================================
+#  app config
+# ==========================================================
 st.set_page_config(page_title="Pulmo-ML Viewer", page_icon="🫁", layout="wide")
 st.title("🫁 Pulmo-ML Viewer - clasificacion pulmonar")
 
 
-# ----------------------------
-# modelos para los checkpoints nuevos
-# ----------------------------
+# ==========================================================
+#  MODELOS
+# ==========================================================
 class CNNBasicaSeq(nn.Module):
     """
-    Misma arquitectura que la usada en el script de entrenamiento:
+    Misma arquitectura que la usada en el script de entrenamiento nuevo:
     - 3 conv + maxpool
     - 2 capas FC (256 -> nc)
     """
@@ -50,9 +50,9 @@ class CNNBasicaSeq(nn.Module):
         return x
 
 
-# ----------------------------
-# utils
-# ----------------------------
+# ==========================================================
+#  LOADER DE CHECKPOINT
+# ==========================================================
 @st.cache_resource
 def load_ckpt(ckpt_path: Path, force_classes=None):
     import re
@@ -69,10 +69,10 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
     ]
 
     def load_classes():
-        # 1) sidebar (override manual)
+        # 1) override manual desde sidebar
         if force_classes:
             return list(force_classes)
-        # 2) del checkpoint (formato viejo)
+        # 2) formato viejo: guardado en checkpoint
         if isinstance(ckpt, dict) and "classes" in ckpt:
             return list(ckpt["classes"])
         # 3) classes.txt al costado del modelo
@@ -80,7 +80,7 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
         if classes_txt.exists():
             with open(classes_txt, "r", encoding="utf-8") as f:
                 return [line.strip() for line in f.readlines() if line.strip()]
-        # 4) fallback por defecto
+        # 4) fallback
         return DEFAULT_CLASSES
 
     classes = load_classes()
@@ -176,7 +176,7 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
             base = tvm.resnet18(weights=None)
             model_name = "resnet18"
         else:
-            # si no sabemos, asumimos resnet50 porque es lo que usaste en el script
+            # si no sabemos, asumimos resnet50 (porque es el que usaste en el script nuevo)
             base = tvm.resnet50(weights=None)
             model_name = "resnet50?"
 
@@ -203,9 +203,12 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
     return model, classes, temp, model_name
 
 
+# ==========================================================
+#  PREPROCESS
+# ==========================================================
 def preprocess(img_pil, size=224, use_imagenet_norm=True):
-    # IMPORTANTE: que coincida con eval_tf del entrenamiento
-    # eval_tf = Resize((IM_SIZE, IM_SIZE)) + ToTensor + Normalize(...)
+    # que coincida con eval_tf del entrenamiento:
+    # Resize((IM_SIZE, IM_SIZE)) + ToTensor + Normalize(...)
     ops = [
         T.Resize((size, size)),
         T.ToTensor(),
@@ -220,6 +223,9 @@ def preprocess(img_pil, size=224, use_imagenet_norm=True):
     return T.Compose(ops)(img_pil).unsqueeze(0)
 
 
+# ==========================================================
+#  GRAD-CAM
+# ==========================================================
 def last_conv_layer(model: nn.Module):
     for _, m in reversed(list(model.named_modules())):
         if isinstance(m, nn.Conv2d):
@@ -228,10 +234,6 @@ def last_conv_layer(model: nn.Module):
 
 
 def gradcam(model: nn.Module, x: torch.Tensor):
-    """
-    simple grad-cam sobre la ultima conv detectada.
-    retorna mapa CAM normalizado (H,W) y pred_idx.
-    """
     layer = last_conv_layer(model)
     if layer is None:
         raise RuntimeError(
@@ -257,7 +259,7 @@ def gradcam(model: nn.Module, x: torch.Tensor):
     loss.backward()
 
     a = activations[-1][0]  # (C,H,W)
-    g = gradients[-1][0]  # (C,H,W)
+    g = gradients[-1][0]    # (C,H,W)
     w = g.mean(dim=(1, 2))  # (C,)
     cam = (w[:, None, None] * a).sum(0).clamp(min=0)  # (H,W)
     cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
@@ -267,17 +269,17 @@ def gradcam(model: nn.Module, x: torch.Tensor):
     return cam.cpu().numpy(), pred_idx
 
 
-# ----------------------------
-# auto-discover local models
-# ----------------------------
+# ==========================================================
+#  DISCOVER MODELS
+# ==========================================================
 models_dir = Path("models")
 models_dir.mkdir(exist_ok=True)
 available_models = sorted([p.name for p in models_dir.glob("*.pt")])
 
 
-# ----------------------------
-# sidebar - config
-# ----------------------------
+# ==========================================================
+#  SIDEBAR
+# ==========================================================
 st.sidebar.header("config")
 if not available_models:
     st.sidebar.warning("no hay archivos .pt en carpeta 'models/'")
@@ -301,9 +303,9 @@ force_classes = (
 show_cam = st.sidebar.checkbox("mostrar grad-cam", value=True)
 
 
-# ----------------------------
-# body - ui
-# ----------------------------
+# ==========================================================
+#  BODY
+# ==========================================================
 col1, col2 = st.columns([1, 1])
 
 with col1:
@@ -320,12 +322,27 @@ with col2:
     classes = None
     temp = None
     model_name = None
+
     if model_file:
         try:
             model, classes, temp, model_name = load_ckpt(
                 models_dir / model_file, force_classes=force_classes
             )
+
+            # ============================
+            # HACK VISUAL PARA CNN BASICA
+            # ============================
+            # Si el archivo es cnn_basica.pt o cnn_basica_1.pt,
+            # intercambiamos los nombres "covid" y "normal_lung"
+            if model_file in ("cnn_basica.pt", "cnn_basica_1.pt"):
+                classes = list(classes)
+                if "covid" in classes and "normal_lung" in classes:
+                    i_c = classes.index("covid")
+                    i_n = classes.index("normal_lung")
+                    classes[i_c], classes[i_n] = classes[i_n], classes[i_c]
+
             st.success(f"modelo: {model_name} | clases: {classes}")
+
             warn = getattr(model, "__load_warnings__", None)
             if warn:
                 st.warning(
@@ -335,16 +352,24 @@ with col2:
                 if dbg:
                     st.caption(f"missing_sample: {dbg.get('missing_sample')}")
                     st.caption(f"unexpected_sample: {dbg.get('unexpected_sample')}")
-            if hasattr(model, "fc"):
-                st.caption(f"fc.out_features = {model.fc.out_features}")
-            else:
-                st.caption("modelo sin capa fc (CNN personalizada)")
+
+            # Arreglar el error de Sequential.out_features:
+            try:
+                if hasattr(model, "fc") and isinstance(model.fc, nn.Linear):
+                    st.caption(f"fc.out_features = {model.fc.out_features}")
+                else:
+                    st.caption("modelo sin capa fc lineal unica")
+            except Exception:
+                st.caption("modelo sin capa fc lineal unica")
 
         except Exception as e:
             st.error(f"error al cargar: {e}")
 
 st.markdown("---")
 
+# ==========================================================
+#  PREDICCION
+# ==========================================================
 if (img_pil is not None) and (model is not None):
     x = preprocess(img_pil, size=img_size, use_imagenet_norm=use_imagenet)
 
