@@ -27,7 +27,7 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
     # -------------------------
-    # clases (mismo comportamiento original + fallback suave)
+    # clases (comportamiento original + fallback suave)
     # -------------------------
     DEFAULT_CLASSES = [
         "bacterial_pneumonia",
@@ -46,7 +46,7 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
             with open(classes_txt, "r", encoding="utf-8") as f:
                 classes = [line.strip() for line in f.readlines() if line.strip()]
         else:
-            # ultimo recurso: usar el orden por defecto de tu dataset
+            # ultimo recurso: usar el orden por defecto
             classes = DEFAULT_CLASSES
 
     num_classes = len(classes)
@@ -84,7 +84,7 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
     sd = strip_prefixes(sd)
 
     # -------------------------
-    # DETECCION REAL DE ARQUITECTURA POR LLAVES
+    # deteccion de tipo de modelo por llaves
     # -------------------------
     has_f_c_keys = any(
         k.startswith(("f.", "c.", "f0.", "f3.", "f6.", "f9.", "c3."))
@@ -93,16 +93,11 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
     has_resnet_layers = any(
         k.startswith("layer1.") or k.startswith("conv1.") for k in sd.keys()
     )
-    has_conv_fc_seq = any(
-        k.startswith("conv.") or k.startswith("fc.") for k in sd.keys()
-    )
 
     # tu CNNSimple SOLO si realmente hay llaves f*/c*
-    is_custom = has_f_c_keys and not has_resnet_layers
+    is_custom = has_f_c_keys
 
-    # -------------------------
     # decidir arquitectura y construir modelo
-    # -------------------------
     from models.cnn_basica_def import CNNSimple
 
     if is_custom:
@@ -116,42 +111,28 @@ def load_ckpt(ckpt_path: Path, force_classes=None):
             fixed[(f"{m.group(1)}{m.group(2)}.{m.group(3)}" if m else k)] = v
         sd = fixed
         model_name = "cnn_basica"
-
     else:
         # ---------- RESNET (igual que tu codigo original) ----------
-        # Si el state_dict tiene capas de ResNet, lo tratamos como resnet,
-        # aunque arch diga "cnn_basica".
-        if has_resnet_layers or model_name.startswith("resnet"):
-            # escogemos resnet50 o resnet18 segun nombre, como antes
-            if "50" in model_name:
-                model = tvm.resnet50(weights=None)
-                model_name = "resnet50"
-            else:
-                model = tvm.resnet18(weights=None)
-                model_name = "resnet18"
+        if model_name == "resnet50":
+            model = tvm.resnet50(weights=None)
         else:
-            # fallback: si no es CNNSimple ni tiene capas de ResNet,
-            # usamos resnet18 como antes (pero ojo que ese ckpt puede no cuadrar)
             model = tvm.resnet18(weights=None)
-            model_name = "resnet18_fallback"
-
         model.fc = nn.Linear(model.fc.in_features, num_classes)
 
-    # --- NORMALIZAR LLAVES DE LA CABEZA FC PARA RESNET (igual que original) ---
-    def remap_resnet_fc_keys(sd: dict):
-        # Si el ckpt trae una cabeza secuencial (fc.1.*), mapeamos a fc.*
-        if "fc.weight" not in sd and any(k.startswith("fc.1.") for k in sd.keys()):
-            fixed = {}
-            for k, v in sd.items():
-                if k.startswith("fc.1."):
-                    fixed["fc." + k[len("fc.1."):]] = v  # fc.1.weight -> fc.weight
-                elif not k.startswith("fc.0."):  # fc.0.* suele ser Dropout/ReLU sin params
-                    fixed[k] = v
-            return fixed
-        return sd
+        # --- NORMALIZAR LLAVES DE LA CABEZA FC PARA RESNET (igual que original) ---
+        def remap_resnet_fc_keys(sd_in: dict):
+            # Si el ckpt trae una cabeza secuencial (fc.1.*), mapeamos a fc.*
+            if "fc.weight" not in sd_in and any(k.startswith("fc.1.") for k in sd_in.keys()):
+                fixed2 = {}
+                for k2, v2 in sd_in.items():
+                    if k2.startswith("fc.1."):
+                        fixed2["fc." + k2[len("fc.1."):]] = v2  # fc.1.weight -> fc.weight
+                    elif not k2.startswith("fc.0."):  # fc.0.* suele ser Dropout/ReLU sin params
+                        fixed2[k2] = v2
+                return fixed2
+            return sd_in
 
-    # solo tiene efecto si hay llaves fc.* de resnet
-    sd = remap_resnet_fc_keys(sd)
+        sd = remap_resnet_fc_keys(sd)
 
     # cargar pesos (estricto; si falla, no estricto + warning)
     try:
@@ -338,7 +319,7 @@ if (img_pil is not None) and (model is not None):
             cam_uint8 = (cam * 255).astype("uint8")
             cam_img = (
                 Image.fromarray(cam_uint8)
-                .resize(img_pil.size, resample=Image.BILINEAR)
+                .resize(img_pil.size)
                 .convert("L")
             )
             img_arr = np.array(img_pil).astype("float32")
